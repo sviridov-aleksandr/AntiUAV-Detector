@@ -1,0 +1,27 @@
+# Зависимости для обучения
+ultralytics>=8.2.0
+opencv-python>=4.8.0
+tqdm>=4.65.0
+torch>=2.1.0
+torchvision>=0.16.0
+onnx>=1.14.0
+onnxruntime>=1.15.0
+tensorrt>=8.6.0  # для Jetson Orin
+
+# Зависимости для детекции и веб-сервера
+fastapi>=0.104.0
+uvicorn>=0.24.0
+websockets>=12.0
+pydantic>=2.5.0
+aiofiles>=23.2.0
+
+# GUI
+PyQt6>=6.6.0
+PyQt6-Qt6>=6.6.0
+PyQt6-sip>=13.6.0
+
+# Вспомогательные
+Pillow>=10.0.0
+numpy>=1.24.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
