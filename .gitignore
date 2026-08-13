@@ -25,12 +25,18 @@ outputs/
 *.pt
 *.onnx
 *.engine
+*.mp4
 
-# Data
+# Data (не пушим датасеты)
 DataSet/
 prepare_data/output/
 prepare_data/drone_detection_thesis/
 prepare_data/combined_dataset/
+prepare_data/drone_only_dataset/
+prepare_data/all_datasets_v1/
+
+# Видео FPV (большие файлы)
+video-FPV/
 
 # OS
 .DS_Store

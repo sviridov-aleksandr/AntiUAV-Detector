@@ -1,9 +1,10 @@
 from ultralytics import YOLO
 
 def main():
-    model = YOLO('/home/alex/AntiUAV-Detector/runs/detect/train/runs/combined_dataset_v1/weights/best.pt')
+    model = YOLO('yolo11l.pt')
+    
     model.train(
-        data='/home/alex/AntiUAV-Detector/prepare_data/combined_dataset/data.yaml',
+        data='/home/alex/AntiUAV-Detector/prepare_data/all_datasets_v1/data.yaml',
         epochs=100,
         imgsz=640,
         batch=16,
@@ -11,11 +12,11 @@ def main():
         workers=0,
         cache='disk',
         project='train/runs',
-        name='combined_dataset_v3',
-        resume=True,
+        name='all_datasets_v1',
         patience=20,
         mixup=0.1,
-        copy_paste=0.3,
+        copy_paste=0.1,
+        close_mosaic=10,
     )
 
 if __name__ == '__main__':
