@@ -34,6 +34,7 @@ prepare_data/drone_detection_thesis/
 prepare_data/combined_dataset/
 prepare_data/drone_only_dataset/
 prepare_data/all_datasets_v1/
+prepare_data/drone_v2/
 
 # Видео FPV (большие файлы)
 video-FPV/
