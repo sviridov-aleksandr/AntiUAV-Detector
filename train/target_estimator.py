@@ -242,6 +242,136 @@ class TargetEstimator:
         self.distances = []
 
 
+class InterceptCalculator:
+    """
+    Compute intercept point (lead pursuit in 3D) for a moving target.
+
+    Given:
+    - Target position (relative to interceptor, NED frame)
+    - Target velocity (m/s, NED)
+    - Interceptor max speed (m/s)
+
+    Solves: find time T such that interceptor can reach the point
+    where target will be at time T.
+
+    Pure pursuit: aim at current target position.
+    Lead pursuit: aim at predicted intercept point.
+    """
+
+    def __init__(self, interceptor_speed=10.0, max_lead_time=10.0):
+        self.interceptor_speed = interceptor_speed  # m/s
+        self.max_lead_time = max_lead_time  # seconds
+
+    def compute(self, target_pos, target_vel):
+        """
+        Compute intercept point.
+
+        Args:
+            target_pos: (x, y, z) relative position in NED (m)
+            target_vel: (vx, vy, vz) target velocity in NED (m/s)
+
+        Returns:
+            dict with:
+                - intercept_point: (x, y, z) where to intercept
+                - time_to_intercept: seconds
+                - bearing: (yaw, pitch) angles to intercept point (rad)
+                - success: bool
+        """
+        target_pos = np.array(target_pos, dtype=float)
+        target_vel = np.array(target_vel, dtype=float)
+
+        # Distance to target now
+        dist_now = np.linalg.norm(target_pos)
+        if dist_now < 1e-6:
+            return {'success': False, 'reason': 'target at origin'}
+
+        # Solve quadratic: |V_i * T|^2 = |P_t + V_t * T|^2
+        # (V_i^2 - V_t^2) * T^2 - 2*(P_t·V_t)*T - |P_t|^2 = 0
+        a = self.interceptor_speed**2 - np.dot(target_vel, target_vel)
+        b = -2.0 * np.dot(target_pos, target_vel)
+        c = -np.dot(target_pos, target_pos)
+
+        T = None
+        if abs(a) < 1e-9:
+            # Linear case (interceptor speed == target speed)
+            if abs(b) > 1e-9:
+                T = -c / b
+        else:
+            disc = b**2 - 4 * a * c
+            if disc >= 0:
+                sqrt_disc = np.sqrt(disc)
+                t1 = (-b + sqrt_disc) / (2 * a)
+                t2 = (-b - sqrt_disc) / (2 * a)
+                # Choose smallest positive root
+                candidates = [t for t in (t1, t2) if t > 0]
+                if candidates:
+                    T = min(candidates)
+
+        if T is None or T <= 0 or T > self.max_lead_time:
+            # Cannot intercept in time — fall back to pure pursuit
+            return {
+                'success': False,
+                'reason': f'no solution (T={T})',
+                'intercept_point': tuple(target_pos),
+                'time_to_intercept': dist_now / self.interceptor_speed,
+                'bearing': self._bearing(target_pos),
+            }
+
+        # Intercept point = where target will be at time T
+        intercept_point = target_pos + target_vel * T
+
+        # Bearing to intercept point
+        bearing = self._bearing(intercept_point)
+
+        return {
+            'success': True,
+            'intercept_point': tuple(intercept_point),
+            'time_to_intercept': T,
+            'bearing': bearing,
+        }
+
+    def _bearing(self, point):
+        """Compute yaw/pitch angles to a point in NED frame."""
+        x, y, z = point
+        yaw = np.arctan2(y, x)      # horizontal angle
+        pitch = np.arctan2(-z, np.sqrt(x**2 + y**2))  # vertical (NED: z down)
+        return (yaw, pitch)
+
+    def compute_from_image(self, bbox_center, distance, target_vel_3d,
+                           focal_px, image_center):
+        """
+        Compute intercept from image-plane measurements.
+        Converts image position + distance to NED, then computes intercept.
+
+        Args:
+            bbox_center: (cx, cy) target center in image (px)
+            distance: estimated distance to target (m)
+            target_vel_3d: (vx, vy, vz) target velocity in NED (m/s)
+            focal_px: camera focal length (px)
+            image_center: (cx, cy) image center (px)
+
+        Returns:
+            dict with intercept info (see compute())
+        """
+        cx, cy = bbox_center
+        icx, icy = image_center
+
+        # Convert image offset to NED (camera frame: x forward, y right, z down)
+        dx_px = cx - icx
+        dy_px = cy - icy
+
+        # Angular offsets
+        yaw_off = np.arctan2(dx_px, focal_px)
+        pitch_off = np.arctan2(dy_px, focal_px)
+
+        # Position in NED (camera frame)
+        x = distance * np.cos(pitch_off) * np.cos(yaw_off)
+        y = distance * np.cos(pitch_off) * np.sin(yaw_off)
+        z = distance * np.sin(pitch_off)
+
+        return self.compute((x, y, z), target_vel_3d)
+
+
 if __name__ == '__main__':
     # Self-test
     print("=== Range Estimation ===")
@@ -264,3 +394,30 @@ if __name__ == '__main__':
             vel = kf.get_velocity()
             print(f"  frame {i}: pos=({pos[0]:.1f},{pos[1]:.1f}) "
                   f"vel=({vel[0]:.1f},{vel[1]:.1f}) lead=({lead[0]:.1f},{lead[1]:.1f})")
+
+    print("\n=== Intercept Calculation ===")
+    calc = InterceptCalculator(interceptor_speed=15.0)
+    # Target 50m ahead, moving right at 5 m/s
+    result = calc.compute((50, 0, 0), (0, 5, 0))
+    print(f"  Target at (50,0,0), vel (0,5,0), interceptor 15 m/s:")
+    print(f"    success={result['success']}")
+    if result['success']:
+        ip = result['intercept_point']
+        T = result['time_to_intercept']
+        yaw, pitch = result['bearing']
+        print(f"    intercept at ({ip[0]:.1f}, {ip[1]:.1f}, {ip[2]:.1f}) in {T:.1f}s")
+        print(f"    bearing: yaw={np.degrees(yaw):.1f}° pitch={np.degrees(pitch):.1f}°")
+
+    # Target moving away (harder)
+    result2 = calc.compute((50, 0, 0), (10, 0, 0))
+    print(f"  Target at (50,0,0), vel (10,0,0) moving away:")
+    print(f"    success={result2['success']}")
+    if result2['success']:
+        ip = result2['intercept_point']
+        T = result2['time_to_intercept']
+        print(f"    intercept at ({ip[0]:.1f}, {ip[1]:.1f}, {ip[2]:.1f}) in {T:.1f}s")
+
+    # Target too fast (cannot intercept)
+    result3 = calc.compute((50, 0, 0), (20, 0, 0))
+    print(f"  Target at (50,0,0), vel (20,0,0) faster than interceptor:")
+    print(f"    success={result3['success']} reason={result3.get('reason')}")
