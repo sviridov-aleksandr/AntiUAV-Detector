@@ -4,10 +4,12 @@ ROS2 Node: Visual Servoing for UAV Interceptor with REAL YOLO detection.
 Subscribes to camera, detects drone using YOLO, computes error, publishes cmd_vel.
 State machine: SEARCH → TRACK → INTERCEPT → STRIKE → LOST → SEARCH.
 
-Hybrid detection:
-- YOLO: primary detector (stable, accurate)
-- Optical Flow: fallback tracker when YOLO loses target (fast/small targets)
-- IR Tracker: thermal fallback for hot targets (drone motor in IR spectrum)
+Hybrid detection (dual-band EO + IR fusion):
+- YOLO: primary detector on EO (visible spectrum, stable, accurate)
+- IR Tracker: thermal detection on IR stream (hot drone motor/body)
+- Optical Flow: fallback tracker when both YOLO and IR lose target
+- Fusion modes: eo_primary (EO→IR→OF), ir_primary (IR→EO→OF),
+  fused (both detect → weighted average)
 
 OSD filtering: rejects detections in edge zones and abnormally small boxes.
 Approach: proportional forward speed based on distance-to-target (bbox ratio).
@@ -117,6 +119,13 @@ class VisionNode(Node):
         self.declare_parameter('ir_min_area', 6)
         self.declare_parameter('ir_min_intensity', 0.6)
 
+        # Dual-band fusion (EO + IR)
+        self.declare_parameter('use_dual_band', False)  # enable IR stream subscription
+        self.declare_parameter('ir_topic', '/camera/ir_image_raw')
+        self.declare_parameter('fusion_mode', 'eo_primary')  # eo_primary|ir_primary|fused
+        self.declare_parameter('fusion_sync_timeout', 0.05)  # max time diff between EO/IR (sec)
+        self.declare_parameter('fusion_ir_weight', 0.4)  # weight of IR in fused mode (0-1)
+
         # Camera / range estimation
         self.declare_parameter('camera_fov_h', 60.0)     # horizontal FOV (deg)
         self.declare_parameter('drone_size_m', 0.35)     # target physical size (m)
@@ -148,6 +157,13 @@ class VisionNode(Node):
         self.ir_fixed_threshold = self.get_parameter('ir_fixed_threshold').value
         self.ir_min_area = self.get_parameter('ir_min_area').value
         self.ir_min_intensity = self.get_parameter('ir_min_intensity').value
+
+        # Dual-band fusion
+        self.use_dual_band = self.get_parameter('use_dual_band').value
+        self.ir_topic = self.get_parameter('ir_topic').value
+        self.fusion_mode = self.get_parameter('fusion_mode').value
+        self.fusion_sync_timeout = self.get_parameter('fusion_sync_timeout').value
+        self.fusion_ir_weight = self.get_parameter('fusion_ir_weight').value
 
         # Target estimator (range + Kalman + lead)
         fov_h = self.get_parameter('camera_fov_h').value
@@ -219,6 +235,17 @@ class VisionNode(Node):
         )
         self.image_sub = self.create_subscription(
             Image, '/camera/image_raw', self.image_callback, video_qos)
+
+        # Dual-band: subscribe to IR stream
+        if self.use_dual_band:
+            self.ir_image_sub = self.create_subscription(
+                Image, self.ir_topic, self.ir_image_callback, video_qos)
+            self.current_ir_image_msg = None
+            self.ir_msg_time = None
+        else:
+            self.current_ir_image_msg = None
+            self.ir_msg_time = None
+
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.state_pub = self.create_publisher(String, '/interceptor/state', 10)
         self.strike_pub = self.create_publisher(String, '/interceptor/strike', 10)
@@ -227,11 +254,19 @@ class VisionNode(Node):
         self.last_time = None
         self.last_detection_source = None
 
-        self.get_logger().info('Vision Node (YOLO + Optical Flow) Started. Waiting for image...')
+        self.get_logger().info(
+            'Vision Node (YOLO + OF + IR' +
+            (' + Dual-Band Fusion' if self.use_dual_band else '') +
+            ') Started. Waiting for image...')
 
     def image_callback(self, msg):
         self.current_image_msg = msg
         self.process_frame()
+
+    def ir_image_callback(self, msg):
+        """Store latest IR frame for dual-band fusion."""
+        self.current_ir_image_msg = msg
+        self.ir_msg_time = self.get_clock().now()
 
     def is_osd_false_positive(self, x1, y1, x2, y2, w, h):
         """Reject detections in OSD edge zones or abnormally small boxes."""
@@ -287,7 +322,11 @@ class VisionNode(Node):
         bbox_ratio = 0.0
         detection_source = "NONE"
 
-        # --- YOLO DETECTION ---
+        # ─── EO DETECTION (YOLO on visible spectrum) ───
+        eo_detected = False
+        eo_x, eo_y = 0, 0
+        eo_ratio = 0.0
+
         results = self.model.track(cv_image, persist=True, verbose=False,
                                    conf=self.conf_threshold)
 
@@ -295,33 +334,99 @@ class VisionNode(Node):
             box = self.select_target(results[0].boxes, w, h)
             if box is not None:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                target_x = (x1 + x2) / 2
-                target_y = (y1 + y2) / 2
-                bbox_area = (x2 - x1) * (y2 - y1)
-                bbox_ratio = bbox_area / (w * h)
-                drone_detected = True
+                eo_x = (x1 + x2) / 2
+                eo_y = (y1 + y2) / 2
+                eo_ratio = ((x2 - x1) * (y2 - y1)) / (w * h)
+                eo_detected = True
                 track_id = int(box.id[0]) if box.id is not None else 0
-                detection_source = "YOLO"
-
-                # Reset OF fallback counter
-                self.of_fallback_counter = 0
-                self.ir_fallback_counter = 0
 
                 cv2.rectangle(cv_image, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-                cv2.putText(cv_image, f"ID:{track_id} DRONE {bbox_ratio:.2f}",
+                cv2.putText(cv_image, f"ID:{track_id} DRONE {eo_ratio:.2f}",
                             (int(x1), int(y1) - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-        # --- OPTICAL FLOW FALLBACK ---
+        # ─── IR DETECTION (thermal stream or same-frame fallback) ───
+        ir_detected = False
+        ir_x, ir_y = 0, 0
+        ir_ratio = 0.0
+
+        if self.use_ir_tracker:
+            ir_frame = None
+            if self.use_dual_band and self.current_ir_image_msg is not None:
+                # Use dedicated IR stream
+                try:
+                    ir_frame = ros_image_to_numpy(self.current_ir_image_msg)
+                except Exception:
+                    ir_frame = None
+            elif not self.use_dual_band:
+                # Same-frame IR fallback (run IR tracker on EO frame)
+                ir_frame = cv_image
+
+            if ir_frame is not None:
+                ir_result = self.ir_tracker.find_target(ir_frame)
+                if ir_result is not None:
+                    x1, y1, x2, y2, cx, cy = ir_result
+                    ir_x, ir_y = cx, cy
+                    ir_ratio = ((x2 - x1) * (y2 - y1)) / (w * h)
+                    ir_detected = True
+
+                    # Draw IR detection on EO frame (for OSD)
+                    cv2.rectangle(cv_image, (x1, y1), (x2, y2), (0, 165, 255), 1)
+                    cv2.putText(cv_image, "IR", (x1, y2 + 15),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
+
+        # ─── FUSION: combine EO + IR detections ───
+        if eo_detected and ir_detected:
+            if self.fusion_mode == 'fused':
+                # Weighted average of EO and IR positions
+                eo_w = 1.0 - self.fusion_ir_weight
+                ir_w = self.fusion_ir_weight
+                target_x = eo_x * eo_w + ir_x * ir_w
+                target_y = eo_y * eo_w + ir_y * ir_w
+                bbox_ratio = max(eo_ratio, ir_ratio)
+                drone_detected = True
+                detection_source = "FUSED"
+                self.of_fallback_counter = 0
+                self.ir_fallback_counter = 0
+            elif self.fusion_mode == 'ir_primary':
+                target_x, target_y = ir_x, ir_y
+                bbox_ratio = ir_ratio
+                drone_detected = True
+                detection_source = "IR_PRIMARY"
+                self.of_fallback_counter = 0
+                self.ir_fallback_counter = 0
+            else:  # eo_primary
+                target_x, target_y = eo_x, eo_y
+                bbox_ratio = eo_ratio
+                drone_detected = True
+                detection_source = "YOLO"
+                self.of_fallback_counter = 0
+                self.ir_fallback_counter = 0
+
+        elif eo_detected:
+            target_x, target_y = eo_x, eo_y
+            bbox_ratio = eo_ratio
+            drone_detected = True
+            detection_source = "YOLO"
+            self.of_fallback_counter = 0
+            self.ir_fallback_counter = 0
+
+        elif ir_detected:
+            target_x, target_y = ir_x, ir_y
+            bbox_ratio = ir_ratio
+            drone_detected = True
+            detection_source = "IR"
+            self.of_fallback_counter = 0
+            self.ir_fallback_counter = 0
+
+        # ─── OPTICAL FLOW FALLBACK (last resort) ───
         if not drone_detected and self.use_optical_flow:
-            # Only try OF for a limited number of frames after YOLO loss
             if self.of_fallback_counter < self.of_fallback_frames:
                 of_result = self.of_tracker.find_target(cv_image)
                 if of_result is not None:
                     x1, y1, x2, y2, cx, cy = of_result
                     target_x, target_y = cx, cy
-                    bbox_area = (x2 - x1) * (y2 - y1)
-                    bbox_ratio = bbox_area / (w * h)
+                    bbox_ratio = ((x2 - x1) * (y2 - y1)) / (w * h)
                     drone_detected = True
                     detection_source = "OPTICAL_FLOW"
 
@@ -330,30 +435,8 @@ class VisionNode(Node):
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
                 self.of_fallback_counter += 1
             else:
-                # OF exhausted — reset for next YOLO detection cycle
                 self.of_fallback_counter = 0
                 self.of_tracker.reset()
-
-        # --- IR TRACKER FALLBACK (thermal) ---
-        if not drone_detected and self.use_ir_tracker:
-            # Try IR tracker after OF is exhausted (or in parallel as last resort)
-            if self.ir_fallback_counter < self.of_fallback_frames:
-                ir_result = self.ir_tracker.find_target(cv_image)
-                if ir_result is not None:
-                    x1, y1, x2, y2, cx, cy = ir_result
-                    target_x, target_y = cx, cy
-                    bbox_area = (x2 - x1) * (y2 - y1)
-                    bbox_ratio = bbox_area / (w * h)
-                    drone_detected = True
-                    detection_source = "IR"
-
-                    cv2.rectangle(cv_image, (x1, y1), (x2, y2), (0, 165, 255), 2)
-                    cv2.putText(cv_image, "IR TRACK", (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
-                self.ir_fallback_counter += 1
-            else:
-                self.ir_fallback_counter = 0
-                self.ir_tracker.reset()
 
         if drone_detected:
             self.lost_counter = 0

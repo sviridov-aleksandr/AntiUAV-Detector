@@ -57,6 +57,21 @@ def generate_launch_description():
             default_value='true',
             description='Show detection window (needs display)'
         ),
+        DeclareLaunchArgument(
+            'use_dual_band',
+            default_value='false',
+            description='Enable dual-band EO+IR fusion (requires IR stream)'
+        ),
+        DeclareLaunchArgument(
+            'fusion_mode',
+            default_value='eo_primary',
+            description='Fusion mode: eo_primary | ir_primary | fused'
+        ),
+        DeclareLaunchArgument(
+            'ir_topic',
+            default_value='/camera/ir_image_raw',
+            description='ROS topic for IR camera stream'
+        ),
 
         # ─── Node 1: Video publisher (camera or test video) ───
         Node(
@@ -73,7 +88,7 @@ def generate_launch_description():
             }],
         ),
 
-        # ─── Node 2: Vision (YOLO + OF + IR + PID state machine) ───
+        # ─── Node 2: Vision (YOLO + OF + IR + Dual-Band Fusion) ───
         Node(
             package='uav_interceptor',
             executable='vision_node',
@@ -82,6 +97,9 @@ def generate_launch_description():
             parameters=[
                 {'model_path': LaunchConfiguration('model_path')},
                 {'show_image': LaunchConfiguration('show_image')},
+                {'use_dual_band': LaunchConfiguration('use_dual_band')},
+                {'fusion_mode': LaunchConfiguration('fusion_mode')},
+                {'ir_topic': LaunchConfiguration('ir_topic')},
             ],
         ),
 
