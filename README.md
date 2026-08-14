@@ -1,239 +1,207 @@
-# Anti-UAV Detector: Система обнаружения дронов на базе YOLOv11
+# Anti-UAV Interceptor — Система автономного перехвата дронов
 
-## 📋 Описание проекта
+Система реального времени для обнаружения, трекинга и перехвата БПЛА. Включает детекцию на базе YOLO11, визуальный сервопривод (PID), интеграцию с автопилотом через MAVLink/ROS2 и деплой на NVIDIA Jetson Orin.
 
-Проект представляет собой систему обнаружения беспилотных летательных аппаратов (БПЛА) в реальном времени. Используется современная архитектура YOLOv11 (Medium) для достижения высокой точности при сохранении скорости инференса, что критично для встраиваемых систем (например, NVIDIA Jetson Orin).
+## Архитектура
 
-### 🎯 Цели проекта
-*   Обнаружение дронов в реальном времени с высокой точностью
-*   Отличение дронов от других летающих объектов (птицы, вертолёты, самолёты)
-*   Поддержка мультимодальных данных (RGB + тепловизор)
-*   Оптимизация для встраиваемых устройств (Jetson Orin)
+```
+Камера → video_publisher → vision_node (YOLO + PID) → /cmd_vel → mavlink_bridge → CUAV X7+ Pro
+                              ↓
+                        /interceptor/state
+```
 
-### ✨ Ключевые возможности
-*   **Обнаружение 4 классов:** Дрон, Вертолёт, Самолёт, Птица
-*   **Высокая точность:** mAP50 > 0.84 на объединённом датасете
-*   **Оптимизация:** Экспорт в TensorRT FP16 для Jetson Orin
-*   **Мультимодальность:** Поддержка RGB и тепловизионных камер
+**Конечный автомат перехвата:**
 
----
+| Состояние | Описание |
+|-----------|----------|
+| `SEARCH` | Поиск цели (синусоидальное вращение по yaw) |
+| `TRACK` | Цель захвачена, PID удержание в центре + пропорциональное сближение |
+| `INTERCEPT` | Цель занимает ≥35% кадра — финальное сближение на максимальной скорости |
+| `LOST` | Цель потеряна — полный стоп, переход в SEARCH после N кадров |
 
-## 📊 Датасеты
+## Компоненты
 
-### 1. Оригинальный датасет
-*   **Объём:** ~51,446 изображений
-*   **Классы:** 1 класс (`drone`)
-*   **Источник:** Собственный набор данных
+### Детекция (YOLO11l)
+- **Модель:** YOLO11l, 1 класс (Drone)
+- **Датасет:** `drone_v2` — 164,732 train / 6,833 val изображений
+- **Метрики (эпоха 12):** mAP50=0.863, mAP50-95=0.430, Precision=0.827, Recall=0.895
+- **TensorRT FP16:** 37.1 FPS на RTX 5080
 
-### 2. Датасет Svanström (2020)
-*   **Объём:** ~15,000 изображений (из 650 видео)
-*   **Классы:** 4 класса (`drone`, `helicopter`, `airplane`, `bird`)
-*   **Источник:** [DroneDetectionThesis/Drone-detection-dataset](https://github.com/DroneDetectionThesis/Drone-detection-dataset)
-*   **Особенности:** Есть тепловизионные (IR) и видимые (Visible) кадры
+### Визуальный сервопривод (PID)
+- **Pan (yaw):** PID по горизонтальной ошибке (цель — центр кадра)
+- **Tilt (высота):** PID по вертикальной ошибке
+- **Approach (вперёд):** пропорционально `bbox_ratio` — чем дальше цель, тем выше скорость
+- **Anti-windup:** ограничение интеграла и выхода
 
-### 3. Объединённый датасет (Combined)
-*   **Объём:** ~66,000 изображений
-*   **Классы:** 4 класса
-*   **Состав:** Оригинальный датасет + Svanström
-*   **Цель:** Повышение обобщающей способности модели
+### Фильтрация ложных срабатываний
+- Отбрасывание детектов в краевых зонах (OSD: текст, иконки, прицел)
+- Минимальный размер bbox — отсек шум и мелкие артефакты
 
----
+### ROS2 интеграция
+- **video_publisher** — публикация кадров в `/camera/image_raw` (BEST_EFFORT QoS)
+- **vision_node** — YOLO + трекинг ByteTrack + PID → `/cmd_vel`, `/interceptor/state`
+- **mavlink_bridge** — `/cmd_vel` → MAVLink velocity commands + телеметрия
 
-## 🏗 Архитектура системы
+### MAVLink (CUAV X7+ Pro)
+- `set_position_target_local_ned_send` (BODY_OFFSET_NED, velocity + yaw_rate)
+- Автоматическая установка режима GUIDED
+- Телеметрия: altitude, GPS, heading, attitude, velocity, mode (10 Hz)
+- Защита: STOP (hover) при отсутствии команд >1с
 
-### Компоненты
-1.  **Подготовка данных:** Скрипты для извлечения кадров, конвертации разметки, объединения датасетов
-2.  **Обучение:** YOLOv11m с кастомными гиперпараметрами
-3.  **Оптимизация:** Экспорт в TensorRT FP16
-4.  **Деплой:** Запуск на NVIDIA Jetson Orin
+## Стек технологий
 
-### Стек технологий
-*   **Язык:** Python 3.14
-*   **Фреймворк:** Ultralytics YOLOv11
-*   **Фреймворк ML:** PyTorch 2.13
-*   **CUDA:** 13.0
-*   **GPU:** NVIDIA GeForce RTX 5080 Laptop (16GB VRAM)
-*   **Целевое устройство:** NVIDIA Jetson Orin
+| Компонент | Версия |
+|-----------|--------|
+| OS | Ubuntu 26.04 (Linux) |
+| Python | 3.14 |
+| ROS2 | Lyrical |
+| Ultralytics | YOLO11l |
+| PyTorch | 2.x (CUDA 13.0) |
+| pymavlink | 2.4.49 |
+| GPU (PC) | RTX 5080 Laptop 16GB |
+| GPU (deploy) | NVIDIA Jetson Orin |
+| Автопилот | CUAV X7+ Pro |
 
----
-
-## 📁 Структура проекта
+## Структура проекта
 
 ```
 AntiUAV-Detector/
-├── train/                    # Скрипты обучения
-│   ├── run_combined.py       # Обучение на объединённом датасете
-│   ├── run_svanstrom.py      # Обучение на датасете Svanström
-│   └── run_v3.py             # Обучение на оригинальном датасете
-├── prepare_data/             # Скрипты подготовки данных
-│   ├── combine_datasets.py   # Объединение датасетов
-│   ├── convert_drone_detection_dataset.py  # Конвертация Svanström
-│   └── output/               # Исходные данные
-├── DataSet/                  # Исходные датасеты
-├── runs/                     # Результаты обучения
-├── README.md                 # Документация
-├── requirements.txt          # Зависимости
-└── .gitignore                # Игнорируемые файлы
+├── train/
+│   └── run_drone_v2.py          # Обучение YOLO11l на drone_v2
+├── prepare_data/
+│   ├── build_drone_v2.py        # Сборка датасета (1 класс Drone + негативы)
+│   ├── fix_class_ids.py         # Исправление ID классов
+│   ├── combine_datasets.py      # Объединение датасетов
+│   └── drone_v2/                # Датасет (data.yaml, train/, val/)
+├── export_tensorrt.py           # Экспорт ONNX + TensorRT FP16
+├── docs/
+│   └── DEPLOY_JETSON.md         # Инструкция деплоя на Jetson Orin
+├── runs/detect/train/runs/      # Результаты обучения (weights/, results.csv)
+├── video-FPV/                   # Тестовые видео
+└── README.md
+
+aerial_nav_ws/                   # ROS2 workspace (отдельно)
+└── src/uav_interceptor/
+    ├── uav_interceptor/
+    │   ├── vision_node.py       # YOLO + PID + state machine
+    │   ├── video_publisher.py   # Камера/видео → ROS Image
+    │   └── mavlink_bridge.py    # ROS → MAVLink + телеметрия
+    ├── launch/
+    │   └── interceptor.launch.py
+    └── config/
+        └── interceptor.rviz
 ```
 
----
+## Установка
 
-## 🚀 Установка и настройка
-
-### 1. Клонирование репозитория
+### 1. Клонирование
 ```bash
-git clone <repository_url>
+git clone https://github.com/sviridov-aleksandr/AntiUAV-Detector.git
 cd AntiUAV-Detector
 ```
 
-### 2. Создание виртуального окружения
+### 2. Виртуальное окружение
 ```bash
 python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# venv\Scripts\activate  # Windows
+source venv/bin/activate
+pip install ultralytics pymavlink pyserial
 ```
 
-### 3. Установка зависимостей
+### 3. ROS2 workspace
 ```bash
-pip install -r requirements.txt
+cd ~/aerial_nav_ws
+colcon build --packages-select uav_interceptor
+source install/setup.bash
 ```
 
-### 4. Проверка установки
+## Обучение
+
 ```bash
-python -c "import ultralytics; print(ultralytics.__version__)"
+source venv/bin/activate
+python train/run_drone_v2.py
 ```
 
----
+Параметры (в `run_drone_v2.py`):
+- `epochs=50`, `patience=20`, `batch=16`, `imgsz=640`
+- `lr0=0.005`, `warmup_epochs=1.0`
+- `mixup=0.0`, `copy_paste=0.0` (отключены — вредят для 1 класса)
+- `close_mosaic=5`, `cache='disk'`
 
-## 📚 Обучение модели
+## Экспорт TensorRT
 
-### 1. Обучение на оригинальном датасете
 ```bash
-python train/run_v3.py
+source venv/bin/activate
+python export_tensorrt.py
 ```
 
-### 2. Обучение на датасете Svanström
+Результат: `best.onnx` (FP32), `best.fp16.onnx`, `best.engine` (FP16).
+
+**Важно:** `.engine` привязан к GPU — на Jetson пересобирать из `.onnx`.
+
+## Запуск
+
+### Полный пайплайн (с автопилотом)
 ```bash
-python train/run_svanstrom.py
+source /opt/ros/lyrical/setup.bash
+source ~/aerial_nav_ws/install/setup.bash
+export PYTHONPATH="$HOME/AntiUAV-Detector/venv/lib/python3.14/site-packages:$PYTHONPATH"
+
+ros2 launch uav_interceptor interceptor.launch.py \
+    model_path:=/home/alex/AntiUAV-Detector/runs/detect/train/runs/drone_v2-4/weights/best.pt \
+    device:=/dev/ttyACM0 \
+    simulation:=false \
+    show_image:=true
 ```
 
-### 3. Обучение на объединённом датасете (Рекомендуется)
+### Simulation (без автопилота)
 ```bash
-python train/run_combined.py
+ros2 launch uav_interceptor interceptor.launch.py \
+    simulation:=true \
+    show_image:=true
 ```
 
-### Гиперпараметры
-*   **Модель:** YOLOv11m
-*   **Эпохи:** 50 (с ранней остановкой patience=15)
-*   **Batch size:** 16
-*   **Image size:** 640
-*   **Optimizer:** MuSGD
-*   **Augmentation:** Mosaic, Mixup (0.1), Copy-Paste (0.1)
+### Параметры launch
 
----
+| Параметр | По умолчанию | Описание |
+|-----------|--------------|----------|
+| `video_path` | `.../v2.mp4` | Тестовое видео |
+| `device` | `/dev/ttyACM0` | MAVLink serial |
+| `simulation` | `false` | Без железа (лог команд) |
+| `model_path` | `.../best.pt` | YOLO модель (.pt/.onnx/.engine) |
+| `show_image` | `true` | Окно детекции |
 
-## 📈 Результаты обучения
+### Настройка PID (ROS params)
 
-### Текущие метрики (Combined Dataset, 9 эпох)
-| Метрика | Значение |
-|---------|----------|
-| **mAP50** | 0.844 |
-| **mAP50-95** | 0.407 |
-| **Precision** | 0.837 |
-| **Recall** | 0.738 |
+| Параметр | По умолчанию | Описание |
+|-----------|--------------|----------|
+| `pid_pan_kp/ki/kd` | 0.05/0.001/0.01 | PID yaw (pan) |
+| `pid_tilt_kp/ki/kd` | 0.05/0.001/0.01 | PID высота (tilt) |
+| `pid_output_limit` | 0.5 | Лимит выхода PID |
+| `approach_speed` | 0.3 | Базовая скорость сближения |
+| `target_bbox_ratio` | 0.15 | Порог перехода TRACK→INTERCEPT |
+| `intercept_bbox_ratio` | 0.35 | Порог финального сближения |
+| `osd_margin` | 60 | Отступ от краёв (фильтр OSD) |
+| `min_bbox_area` | 500 | Мин. площадь bbox |
+| `conf_threshold` | 0.4 | Порог уверенности YOLO |
 
-### Сравнение датасетов
-| Датасет | mAP50 | mAP50-95 | Precision | Recall |
-|---------|-------|----------|-----------|--------|
-| Оригинальный (51К) | 0.990 | 0.776 | 0.985 | 0.972 |
-| Svanström (15К) | 0.839 | 0.407 | 0.832 | 0.698 |
-| Combined (66К) | 0.844 | 0.407 | 0.837 | 0.738 |
+## Топики ROS2
 
----
+| Топик | Тип | QoS | Описание |
+|-------|-----|-----|----------|
+| `/camera/image_raw` | Image | BEST_EFFORT | Видеопоток |
+| `/cmd_vel` | Twist | RELIABLE | Команды движения |
+| `/interceptor/state` | String | RELIABLE | SEARCH/TRACK/INTERCEPT/LOST |
+| `/telemetry/altitude` | Float64 | RELIABLE | Высота (м) |
+| `/telemetry/gps` | NavSatFix | RELIABLE | GPS координаты |
+| `/telemetry/heading` | Float64 | RELIABLE | Курс (град) |
+| `/telemetry/attitude` | Imu | RELIABLE | Отношение (IMU) |
+| `/telemetry/velocity` | Vector3Stamped | RELIABLE | Скорость (м/с) |
+| `/telemetry/mode` | String | RELIABLE | Режим автопилота |
 
-## 🛠 Экспорт и деплой
+## Деплой на Jetson Orin
 
-### 1. Экспорт в TensorRT
-```python
-from ultralytics import YOLO
-model = YOLO('best.pt')
-model.export(format='engine', half=True, dynamic=False, simplify=True)
-```
+См. [docs/DEPLOY_JETSON.md](docs/DEPLOY_JETSON.md) — подробная инструкция по переносу, пересборке TensorRT и интеграции ROS2.
 
-### 2. Форматы экспорта
-*   **ONNX:** Универсальный формат для кросс-платформенного использования
-*   **TensorRT FP16:** Оптимизация для NVIDIA Jetson Orin
-*   **TensorRT INT8:** Максимальная скорость (требует калибровки)
+## Лицензия
 
-### 3. Деплой на Jetson Orin
-1.  Скопировать `.engine` файл на устройство
-2.  Установить TensorRT той же версии
-3.  Настроить режим питания `MAXN`
-4.  Запустить инференс
-
----
-
-## 📊 Визуализация результатов
-
-### Графики обучения
-*   `results.png` — графики loss и метрик
-*   `confusion_matrix.png` — матрица ошибок
-*   `labels.jpg` — визуализация разметки
-
-### Инференс
-```python
-from ultralytics import YOLO
-model = YOLO('best.pt')
-results = model.predict(source='video.mp4', save=True)
-```
-
----
-
-## 🔧 Настройка гиперпараметров
-
-### Основные параметры
-*   `epochs`: Количество эпох обучения
-*   `batch`: Размер батча (зависит от VRAM)
-*   `imgsz`: Размер входного изображения
-*   `lr0`: Начальная скорость обучения
-*   `weight_decay`: Регуляризация
-
-### Аугментация данных
-*   `mosaic`: Вероятность применения Mosaic
-*   `mixup`: Вероятность применения Mixup
-*   `copy_paste`: Вероятность применения Copy-Paste
-*   `hsv_h`, `hsv_s`, `hsv_v`: Сдвиг HSV цветов
-
----
-
-## 📝 Лог изменений
-
-### Версия 1.0 (12.08.2026)
-*   Инициализация проекта
-*   Подготовка датасетов
-*   Обучение базовой модели
-*   Создание документации
-
----
-
-## 👥 Авторы
-
-Проект разработан для задачи Anti-UAV.
-
-### Вклад
-*   Разработка архитектуры
-*   Подготовка датасетов
-*   Обучение и оптимизация моделей
-*   Документация
-
----
-
-## 📄 Лицензия
-
-MIT License
-
----
-
-## 📞 Контакты
-
-По вопросам проекта обращайтесь к разработчикам.
+MIT
