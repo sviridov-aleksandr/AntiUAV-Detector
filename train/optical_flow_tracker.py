@@ -107,6 +107,107 @@ class OpticalFlowTracker:
         return (cx < margin_x or cx > frame_w - margin_x or
                 cy < margin_y or cy > frame_h - margin_y)
 
+    def find_candidates(self, frame, max_candidates=5):
+        """
+        Find ALL moving objects (candidates) in frame via optical flow.
+        Returns list of dicts: {bbox: (x1,y1,x2,y2), center: (cx,cy), area, speed}
+        Used as region proposals for YOLO verification (small/distant targets).
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape[:2]
+
+        if self.prev_gray is None:
+            self.prev_gray = gray
+            self.prev_full_gray = gray
+            return []
+
+        s = self.flow_scale
+        small_prev = cv2.resize(self.prev_gray, None, fx=s, fy=s)
+        small_curr = cv2.resize(gray, None, fx=s, fy=s)
+        small_h, small_w = small_curr.shape[:2]
+
+        # Global motion compensation
+        self._compute_global_motion(self.prev_full_gray, gray)
+        compensated_prev = small_prev
+        if self.affine is not None:
+            compensated_prev = cv2.warpAffine(
+                small_prev, self.affine,
+                (small_w, small_h),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE)
+
+        # Dense optical flow
+        flow = cv2.calcOpticalFlowFarneback(
+            compensated_prev, small_curr,
+            None, 0.5, 3, 15, 3, 5, 1.2, 0)
+
+        mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+
+        # Motion mask
+        motion = (mag > self.motion_threshold).astype(np.uint8) * 255
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        motion = cv2.morphologyEx(motion, cv2.MORPH_OPEN, kernel, iterations=1)
+        motion = cv2.morphologyEx(motion, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        # Edge zone mask
+        mx = int(small_w * self.edge_margin)
+        my = int(small_h * self.edge_margin)
+        motion[0:my, :] = 0
+        motion[small_h-my:small_h, :] = 0
+        motion[:, 0:mx] = 0
+        motion[:, small_w-mx:small_w] = 0
+
+        self.last_motion = motion
+
+        # Connected components
+        n, labels, stats, centroids = cv2.connectedComponentsWithStats(motion)
+        frame_area = small_h * small_w
+
+        candidates = []
+        for i in range(1, n):
+            x, y, bw, bh, area = stats[i]
+            cx, cy = centroids[i]
+
+            if area < self.min_area:
+                continue
+            if area > frame_area * self.max_area_ratio:
+                continue
+
+            if bw > 0 and bh > 0:
+                ar = bw / bh
+                if ar > 5.0 or ar < 0.2:
+                    continue
+
+            blob_mask = (labels == i).astype(np.uint8)
+            mean_mag = cv2.mean(mag, mask=blob_mask)[0]
+            if mean_mag < self.min_speed:
+                continue
+
+            # Scale to full resolution
+            scale = 1.0 / self.flow_scale
+            x1 = max(0, int(x * scale))
+            y1 = max(0, int(y * scale))
+            x2 = min(w, int((x + bw) * scale))
+            y2 = min(h, int((y + bh) * scale))
+            cx_full = int(cx * scale)
+            cy_full = int(cy * scale)
+
+            candidates.append({
+                'bbox': (x1, y1, x2, y2),
+                'center': (cx_full, cy_full),
+                'area': area,
+                'speed': mean_mag,
+            })
+
+        # Sort by area (largest first), limit count
+        candidates.sort(key=lambda c: c['area'], reverse=True)
+        candidates = candidates[:max_candidates]
+
+        self.prev_gray = gray
+        self.prev_full_gray = gray
+        return candidates
+
     def find_target(self, frame):
         """
         Detect moving target in frame using optical flow.
