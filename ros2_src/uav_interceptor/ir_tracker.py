@@ -70,7 +70,11 @@ class IRTracker:
         self.last_center = None
 
     def _threshold(self, gray):
-        """Apply threshold to isolate hot spots."""
+        """Пороговая обработка для выделения горячих пятен.
+        Режимы:
+          fixed — фиксированный порог (для стабильного фона)
+          otsu — автоматический порог Оцу (для контрастных сцен)
+          adaptive — адаптивный порог (для неравномерного фона)"""
         if self.threshold_mode == 'fixed':
             _, mask = cv2.threshold(gray, self.fixed_threshold, 255,
                                     cv2.THRESH_BINARY)
@@ -92,11 +96,10 @@ class IRTracker:
                 cy < margin_y or cy > frame_h - margin_y)
 
     def find_target(self, frame):
-        """
-        Detect hot target in IR frame.
-        Returns (x1, y1, x2, y2, center_x, center_y) or None.
-        Only returns after min_persistence consecutive detections.
-        """
+        """Детекция горячей цели в IR-кадре.
+        Возвращает (x1, y1, x2, y2, cx, cy) или None.
+        Возвращает результат только после min_persistence
+        последовательных детекций (подавление ложных срабатываний)."""
         if frame.ndim == 3:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         else:

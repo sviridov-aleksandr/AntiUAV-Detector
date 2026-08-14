@@ -322,7 +322,8 @@ class VisionNode(Node):
         bbox_ratio = 0.0
         detection_source = "NONE"
 
-        # ─── EO DETECTION (YOLO on visible spectrum) ───
+        # ─── EO DETECTION (YOLO на видимом спектре) ───
+        # Основной детектор: YOLO11 на RGB-кадре. ByteTrack для трекинга.
         eo_detected = False
         eo_x, eo_y = 0, 0
         eo_ratio = 0.0
@@ -345,7 +346,10 @@ class VisionNode(Node):
                             (int(x1), int(y1) - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-        # ─── IR DETECTION (thermal stream or same-frame fallback) ───
+        # ─── IR DETECTION (тепловизионный поток или fallback на тот же кадр) ───
+        # IR-трекер ищет горячие пятна (двигатель дрона) на тепловизионном кадре.
+        # При use_dual_band=True используется отдельный IR-поток,
+        # иначе IR-трекер работает на том же EO-кадре (fallback).
         ir_detected = False
         ir_x, ir_y = 0, 0
         ir_ratio = 0.0
@@ -375,7 +379,11 @@ class VisionNode(Node):
                     cv2.putText(cv_image, "IR", (x1, y2 + 15),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
 
-        # ─── FUSION: combine EO + IR detections ───
+        # ─── FUSION: объединение детекций EO + IR ───
+        # 3 режима:
+        #   eo_primary — EO главное, IR как резерв (день, хорошая видимость)
+        #   ir_primary — IR главное, EO как резерв (ночь, туман)
+        #   fused — взвешенное среднее позиций (макс. устойчивость)
         if eo_detected and ir_detected:
             if self.fusion_mode == 'fused':
                 # Weighted average of EO and IR positions
@@ -419,7 +427,10 @@ class VisionNode(Node):
             self.of_fallback_counter = 0
             self.ir_fallback_counter = 0
 
-        # ─── OPTICAL FLOW FALLBACK (last resort) ───
+        # ─── OPTICAL FLOW FALLBACK (последний рубеж) ───
+        # Если ни YOLO, ни IR не обнаружили цель — пытаемся найти
+        # движущийся объект через плотный оптический поток Farneback.
+        # Ограничение: только of_fallback_frames кадров после потери.
         if not drone_detected and self.use_optical_flow:
             if self.of_fallback_counter < self.of_fallback_frames:
                 of_result = self.of_tracker.find_target(cv_image)
@@ -446,13 +457,14 @@ class VisionNode(Node):
                 self.get_logger().info(f'Detection source: {detection_source}')
                 self.last_detection_source = detection_source
 
-            # Update target estimator (range + Kalman + lead)
+            # Обновление оценщика: дальность (pinhole) + Kalman + lead pursuit
             est_info = self.target_estimator.update(
                 (int(target_x - 20), int(target_y - 20),
                  int(target_x + 20), int(target_y + 20)),
                 dt=dt)
 
-            # Aim at lead point (predicted position ahead) for moving targets
+            # Прицеливание в lead point — предсказанную позицию цели
+            # на lead_frames кадров вперёд (для движущихся целей)
             lead_point = est_info['lead_point']
             if lead_point is not None:
                 aim_x, aim_y = lead_point
@@ -462,12 +474,12 @@ class VisionNode(Node):
             error_x = aim_x - center_x
             error_y = aim_y - center_y
 
-            # Yaw (pan) from horizontal error (lead pursuit)
+            # Yaw (pan) — горизонтальная ошибка, PID удержание
             cmd_vel.angular.z = float(self.pid_pan.compute(error_x, dt))
-            # Altitude from vertical error
+            # Высота (tilt) — вертикальная ошибка, PID удержание
             cmd_vel.linear.z = float(self.pid_tilt.compute(error_y, dt))
 
-            # Distance-based approach
+            # Сближение: пропорционально дальности (чем дальше — тем быстрее)
             distance = est_info['distance']
             if distance is not None:
                 # Proportional approach: faster when far, slower when close
@@ -484,17 +496,18 @@ class VisionNode(Node):
                 else:
                     cmd_vel.linear.x = float(self.approach_speed)
 
-            # State transition based on distance
+            # ─── Переход состояний по дальности ───
             if distance is not None and distance < self.kill_radius:
-                self.state = State.STRIKE
+                self.state = State.STRIKE  # Цель в радиусе поражения
             elif distance is not None and distance < self.intercept_distance:
-                self.state = State.INTERCEPT
+                self.state = State.INTERCEPT  # Финальное сближение
             elif bbox_ratio >= self.intercept_bbox_ratio:
                 self.state = State.INTERCEPT
             else:
-                self.state = State.TRACK
+                self.state = State.TRACK  # Удержание + сближение
 
-            # --- INTERCEPT: compute intercept point and aim at it ---
+            # ─── INTERCEPT: расчёт точки перехвата и прицеливание ───
+            # Оценка 3D-скорости цели по image-velocity + дальности
             if self.state == State.INTERCEPT and distance is not None:
                 # Estimate target 3D velocity from image velocity + distance
                 vx_px, vy_px = est_info['velocity']
@@ -559,7 +572,9 @@ class VisionNode(Node):
                             f"INTERCEPT T={T:.1f}s ({ip[0]:.0f},{ip[1]:.0f},{ip[2]:.0f})",
                             (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
-            # --- STRIKE: proximity fuze — detonate warhead ---
+            # ─── STRIKE: proximity fuze — подрыв боевой части ───
+            # Срабатывает при distance < kill_radius (4.0 м).
+            # Публикует /interceptor/strike однократно → MAVLink DO_SET_SERVO.
             if self.state == State.STRIKE:
                 cmd_vel.linear.x = float(self.approach_speed * 1.5)
                 cmd_vel.angular.z = 0.0

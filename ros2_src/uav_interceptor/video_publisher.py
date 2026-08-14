@@ -96,7 +96,8 @@ class VideoPublisher(Node):
                 self.reconnect_interval, self._reconnect_and_publish)
 
     def _open_rtsp(self):
-        """Open RTSP stream (OpenIPC camera)."""
+        """Открытие RTSP-потока (камера OpenIPC MC800S-V3).
+        FFmpeg backend с BUFFERSIZE=1 для минимальной задержки (60-80ms)."""
         rtsp_url = self.get_parameter('rtsp_url').value
         self.source_label = f'RTSP: {rtsp_url}'
 
@@ -127,7 +128,8 @@ class VideoPublisher(Node):
         self.cap = cv2.VideoCapture(video_path)
 
     def _reconnect_and_publish(self):
-        """Attempt to reconnect to source and start publishing."""
+        """Авто-реконект при потере потока (RTSP/USB).
+        Пытается переподключиться каждые reconnect_interval секунд."""
         now = time.time()
         if now - self.last_reconnect < self.reconnect_interval:
             return
