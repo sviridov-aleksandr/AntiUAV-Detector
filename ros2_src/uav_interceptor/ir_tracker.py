@@ -25,7 +25,7 @@ import numpy as np
 
 class IRTracker:
     def __init__(self,
-                 threshold_mode='adaptive',  # 'adaptive' | 'fixed' | 'otsu'
+                 threshold_mode='adaptive',  # 'adaptive'|'fixed'|'otsu'|'motion'
                  fixed_threshold=200,        # for 'fixed' mode (0-255)
                  adaptive_block=51,          # block size for adaptive threshold
                  adaptive_c=15,              # C constant for adaptive threshold
@@ -36,7 +36,10 @@ class IRTracker:
                  hist_len=5,                 # History length for smoothing
                  edge_margin=0.06,           # Fraction of frame to exclude
                  min_persistence=3,          # Min consecutive detections
-                 max_gap=3):                 # Max missed frames before lost
+                 max_gap=3,                  # Max missed frames before lost
+                 motion_threshold=15,        # Pixel diff for 'motion' mode
+                 motion_min_area=20,         # Min area for motion blobs
+                 motion_max_area=3000):      # Max area for motion blobs
         self.threshold_mode = threshold_mode
         self.fixed_threshold = fixed_threshold
         self.adaptive_block = adaptive_block
@@ -49,10 +52,16 @@ class IRTracker:
         self.edge_margin = edge_margin
         self.min_persistence = min_persistence
         self.max_gap = max_gap
+        self.motion_threshold = motion_threshold
+        self.motion_min_area = motion_min_area
+        self.motion_max_area = motion_max_area
 
         self.positions = []
         self.target_bbox = None
         self.last_mask = None
+
+        # Для режима 'motion': предыдущий кадр
+        self.prev_gray = None
 
         # Persistence tracking
         self.persistence_count = 0
@@ -64,6 +73,7 @@ class IRTracker:
         self.positions = []
         self.target_bbox = None
         self.last_mask = None
+        self.prev_gray = None
         self.persistence_count = 0
         self.gap_count = 0
         self.confirmed = False
@@ -74,8 +84,11 @@ class IRTracker:
         Режимы:
           fixed — фиксированный порог (для стабильного фона)
           otsu — автоматический порог Оцу (для контрастных сцен)
-          adaptive — адаптивный порог (для неравномерного фона)"""
-        if self.threshold_mode == 'fixed':
+          adaptive — адаптивный порог (для неравномерного фона)
+          motion — frame differencing (для низкоконтрастных тепловизоров)"""
+        if self.threshold_mode == 'motion':
+            return self._motion_mask(gray)
+        elif self.threshold_mode == 'fixed':
             _, mask = cv2.threshold(gray, self.fixed_threshold, 255,
                                     cv2.THRESH_BINARY)
         elif self.threshold_mode == 'otsu':
@@ -85,6 +98,20 @@ class IRTracker:
             mask = cv2.adaptiveThreshold(
                 gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                 cv2.THRESH_BINARY, self.adaptive_block, self.adaptive_c)
+        return mask
+
+    def _motion_mask(self, gray):
+        """Frame differencing для низкоконтрастных тепловизоров.
+        Дрон выделяется по движению на статичном фоне.
+        Возвращает бинарную маску движущихся объектов."""
+        if self.prev_gray is None:
+            self.prev_gray = gray.copy()
+            return np.zeros_like(gray)
+
+        diff = cv2.absdiff(gray, self.prev_gray)
+        _, mask = cv2.threshold(diff, self.motion_threshold, 255,
+                                cv2.THRESH_BINARY)
+        self.prev_gray = gray.copy()
         return mask
 
     def _is_in_edge_zone(self, x, y, bw, bh, frame_w, frame_h):
@@ -110,10 +137,14 @@ class IRTracker:
         # Threshold
         mask = self._threshold(gray)
 
-        # Morphology: open (remove noise) + close (merge nearby blobs)
+        # Морфология: для motion — только close (объединить),
+        # для пороговых режимов — open + close
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        if self.threshold_mode == 'motion':
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        else:
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
         # Edge zone exclusion
         mx = int(w * self.edge_margin)
@@ -130,27 +161,37 @@ class IRTracker:
         frame_area = h * w
 
         candidates = []
+        is_motion = (self.threshold_mode == 'motion')
         for i in range(1, n):
             x, y, bw, bh, area = stats[i]
             cx, cy = centroids[i]
 
-            if area < self.min_area:
-                continue
-            if area > frame_area * self.max_area_ratio:
-                continue
+            if is_motion:
+                # В режиме motion: фильтр по площади движения
+                if area < self.motion_min_area:
+                    continue
+                if area > self.motion_max_area:
+                    continue
+            else:
+                if area < self.min_area:
+                    continue
+                if area > frame_area * self.max_area_ratio:
+                    continue
 
             if bw > 0 and bh > 0:
                 ar = bw / bh
                 if ar > self.max_aspect_ratio or ar < 1.0 / self.max_aspect_ratio:
                     continue
 
-            # Mean intensity in blob (normalized 0-1)
-            blob_mask = (labels == i).astype(np.uint8)
-            mean_int = cv2.mean(gray, mask=blob_mask)[0] / 255.0
-            if mean_int < self.min_intensity:
-                continue
-
-            candidates.append((area, x, y, bw, bh, cx, cy, mean_int))
+            if not is_motion:
+                # Mean intensity in blob (normalized 0-1)
+                blob_mask = (labels == i).astype(np.uint8)
+                mean_int = cv2.mean(gray, mask=blob_mask)[0] / 255.0
+                if mean_int < self.min_intensity:
+                    continue
+                candidates.append((area, x, y, bw, bh, cx, cy, mean_int))
+            else:
+                candidates.append((area, x, y, bw, bh, cx, cy, 1.0))
 
         candidates.sort(reverse=True)
 

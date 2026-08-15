@@ -114,7 +114,7 @@ class VisionNode(Node):
 
         # IR tracker fallback (thermal camera)
         self.declare_parameter('use_ir_tracker', True)
-        self.declare_parameter('ir_threshold_mode', 'adaptive')  # adaptive|fixed|otsu
+        self.declare_parameter('ir_threshold_mode', 'adaptive')  # adaptive|fixed|otsu|motion
         self.declare_parameter('ir_fixed_threshold', 200)
         self.declare_parameter('ir_min_area', 6)
         self.declare_parameter('ir_min_intensity', 0.6)

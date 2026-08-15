@@ -49,7 +49,7 @@ def generate_launch_description():
         # ─── Vision ───
         DeclareLaunchArgument(
             'model_path',
-            default_value='/home/alex/AntiUAV-Detector/runs/detect/train/runs/drone_v2-4/weights/best.pt',
+            default_value='/home/alex/AntiUAV-Detector/runs/detect/train/runs/drone_v2-5/weights/best.pt',
             description='YOLO model path (.pt, .onnx or .engine)'
         ),
         DeclareLaunchArgument(
@@ -71,6 +71,11 @@ def generate_launch_description():
             'ir_topic',
             default_value='/camera/ir_image_raw',
             description='ROS topic for IR camera stream'
+        ),
+        DeclareLaunchArgument(
+            'ir_threshold_mode',
+            default_value='adaptive',
+            description='IR tracker mode: adaptive | fixed | otsu | motion'
         ),
 
         # ─── Node 1: Video publisher (camera or test video) ───
@@ -100,6 +105,7 @@ def generate_launch_description():
                 {'use_dual_band': LaunchConfiguration('use_dual_band')},
                 {'fusion_mode': LaunchConfiguration('fusion_mode')},
                 {'ir_topic': LaunchConfiguration('ir_topic')},
+                {'ir_threshold_mode': LaunchConfiguration('ir_threshold_mode')},
             ],
         ),
 
