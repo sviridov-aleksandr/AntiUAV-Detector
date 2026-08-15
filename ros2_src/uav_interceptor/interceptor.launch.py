@@ -18,11 +18,11 @@ def generate_launch_description():
     return LaunchDescription([
         # ─── Video source (WFB) ───
         DeclareLaunchArgument(
-            'eo_pipe', default_value='/tmp/wfb_rx_video0',
-            description='WFB rx pipe: EO-видео (OpenIPC H.265)'),
+            'eo_udp_port', default_value='5600',
+            description='UDP порт: EO-видео (WFB-ng gs_video0)'),
         DeclareLaunchArgument(
-            'ir_pipe', default_value='/tmp/wfb_rx_video1',
-            description='WFB rx pipe: IR-видео (H.264)'),
+            'ir_udp_port', default_value='5601',
+            description='UDP порт: IR-видео (WFB-ng gs_video1)'),
         DeclareLaunchArgument(
             'eo_format', default_value='h265',
             description='EO-видео кодек: h265 | h264'),
@@ -44,13 +44,10 @@ def generate_launch_description():
         # ─── MAVLink ───
         DeclareLaunchArgument(
             'link_mode', default_value='radio',
-            description='MAVLink: radio (WFB) | direct (USB/UART)'),
+            description='MAVLink: radio (WFB-ng UDP) | direct (USB/UART)'),
         DeclareLaunchArgument(
-            'wfb_tx_pipe', default_value='/tmp/wfb_tx_command',
-            description='WFB tx pipe: команды вверх'),
-        DeclareLaunchArgument(
-            'wfb_rx_pipe', default_value='/tmp/wfb_rx_telemetry',
-            description='WFB rx pipe: телеметрия вниз'),
+            'mavlink_udp_port', default_value='14550',
+            description='UDP порт для WFB-ng gs_mavlink'),
         DeclareLaunchArgument(
             'device', default_value='/dev/ttyACM0',
             description='MAVLink device (для link_mode=direct)'),
@@ -85,8 +82,8 @@ def generate_launch_description():
             name='wfb_video_receiver',
             output='screen',
             parameters=[{
-                'eo_pipe': LaunchConfiguration('eo_pipe'),
-                'ir_pipe': LaunchConfiguration('ir_pipe'),
+                'eo_udp_port': LaunchConfiguration('eo_udp_port'),
+                'ir_udp_port': LaunchConfiguration('ir_udp_port'),
                 'eo_format': LaunchConfiguration('eo_format'),
                 'ir_format': LaunchConfiguration('ir_format'),
                 'eo_width': LaunchConfiguration('eo_width'),
@@ -121,8 +118,7 @@ def generate_launch_description():
             output='screen',
             parameters=[
                 {'link_mode': LaunchConfiguration('link_mode')},
-                {'wfb_tx_pipe': LaunchConfiguration('wfb_tx_pipe')},
-                {'wfb_rx_pipe': LaunchConfiguration('wfb_rx_pipe')},
+                {'mavlink_udp_port': LaunchConfiguration('mavlink_udp_port')},
                 {'device': LaunchConfiguration('device')},
                 {'simulation': LaunchConfiguration('simulation')},
             ],

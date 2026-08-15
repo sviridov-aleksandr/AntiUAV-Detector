@@ -35,6 +35,7 @@ from pymavlink import mavutil
 import time
 import math
 import os
+import socket
 import struct
 
 
@@ -46,8 +47,7 @@ class MavlinkBridge(Node):
         self.declare_parameter('link_mode', 'radio')  # radio | direct
         self.declare_parameter('device', '/dev/ttyACM0')  # для direct
         self.declare_parameter('baudrate', 921600)
-        self.declare_parameter('wfb_tx_pipe', '/tmp/wfb_tx_command')  # команды вверх
-        self.declare_parameter('wfb_rx_pipe', '/tmp/wfb_rx_telemetry')  # телеметрия вниз
+        self.declare_parameter('mavlink_udp_port', 14550)  # WFB-ng gs_mavlink
         self.declare_parameter('simulation', True)
 
         # ─── Параметры БЧ ───
@@ -65,8 +65,7 @@ class MavlinkBridge(Node):
         self.link_mode = self.get_parameter('link_mode').value
         self.device = self.get_parameter('device').value
         self.baudrate = self.get_parameter('baudrate').value
-        self.wfb_tx_pipe = self.get_parameter('wfb_tx_pipe').value
-        self.wfb_rx_pipe = self.get_parameter('wfb_rx_pipe').value
+        self.mavlink_udp_port = self.get_parameter('mavlink_udp_port').value
         self.simulation = self.get_parameter('simulation').value
         self.strike_servo_channel = self.get_parameter('strike_servo_channel').value
         self.strike_servo_pwm = self.get_parameter('strike_servo_pwm').value
@@ -116,8 +115,7 @@ class MavlinkBridge(Node):
 
         # ─── MAVLink connection ───
         self.mavlink_conn = None
-        self.tx_pipe_fd = None  # WFB tx (команды вверх)
-        self.rx_pipe_fd = None  # WFB rx (телеметрия вниз)
+        self.udp_sock = None  # UDP socket (radio mode)
         self.rx_buf = bytearray()
 
         self.armed = False
@@ -154,30 +152,23 @@ class MavlinkBridge(Node):
             self._connect_direct()
 
     def _connect_radio(self):
-        """Подключение через WFB named pipes."""
-        # TX pipe: команды вверх (создаётся WFB-ng)
-        if not os.path.exists(self.wfb_tx_pipe):
-            try:
-                os.mkfifo(self.wfb_tx_pipe)
-            except FileExistsError:
-                pass
+        """Подключение через WFB-ng (UDP 14550).
 
-        # RX pipe: телеметрия вниз
-        if not os.path.exists(self.wfb_rx_pipe):
-            try:
-                os.mkfifo(self.wfb_rx_pipe)
-            except FileExistsError:
-                pass
-
+        WFB-ng на земле (gs.cfg) пробрасывает MAVLink:
+          gs_mavlink peer = connect://127.0.0.1:14550
+        Этот узел слушает UDP 14550 и общается с бортом через WFB-ng.
+        """
         try:
-            self.tx_pipe_fd = os.open(
-                self.wfb_tx_pipe, os.O_WRONLY | os.O_NONBLOCK)
-            self.rx_pipe_fd = os.open(
-                self.wfb_rx_pipe, os.O_RDONLY | os.O_NONBLOCK)
+            self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2097152)
+            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2097152)
+            self.udp_sock.bind(('127.0.0.1', self.mavlink_udp_port))
+            self.udp_sock.settimeout(0.05)
             self.get_logger().info(
-                f'WFB radio: tx={self.wfb_tx_pipe}, rx={self.wfb_rx_pipe}')
+                f'WFB radio: UDP 127.0.0.1:{self.mavlink_udp_port} '
+                f'(WFB-ng gs_mavlink)')
         except Exception as e:
-            self.get_logger().error(f'WFB pipe open failed: {e}')
+            self.get_logger().error(f'UDP socket failed: {e}')
             self.simulation = True
 
     def _connect_direct(self):
@@ -228,14 +219,15 @@ class MavlinkBridge(Node):
     # ─────────────────────────────────────────────────────────
 
     def _send_raw(self, data: bytes):
-        """Отправка raw MAVLink байтов (через WFB или direct)."""
+        """Отправка raw MAVLink байтов (через UDP или direct)."""
         if self.simulation:
             return
-        if self.link_mode == 'radio' and self.tx_pipe_fd is not None:
+        if self.link_mode == 'radio' and self.udp_sock is not None:
             try:
-                os.write(self.tx_pipe_fd, data)
-            except (BlockingIOError, BrokenPipeError):
-                pass  # pipe полон — пропускаем
+                # WFB-ng gs_mavlink слушает UDP 14550
+                self.udp_sock.sendto(data, ('127.0.0.1', self.mavlink_udp_port))
+            except Exception:
+                pass
         elif self.mavlink_conn is not None:
             self.mavlink_conn.write(data)
 
@@ -379,19 +371,19 @@ class MavlinkBridge(Node):
         if self.simulation:
             return
 
-        if self.link_mode == 'radio' and self.rx_pipe_fd is not None:
+        if self.link_mode == 'radio' and self.udp_sock is not None:
             self._read_radio_telemetry()
         elif self.mavlink_conn is not None:
             self._read_direct_telemetry()
 
     def _read_radio_telemetry(self):
-        """Чтение телеметрии из WFB rx pipe."""
+        """Чтение телеметрии из UDP (WFB-ng gs_mavlink)."""
         try:
-            data = os.read(self.rx_pipe_fd, 4096)
+            data, _ = self.udp_sock.recvfrom(4096)
             if data:
                 self.rx_buf.extend(data)
                 self._process_rx_buffer()
-        except BlockingIOError:
+        except socket.timeout:
             pass
         except Exception as e:
             self.get_logger().debug(f'RX read error: {e}')
