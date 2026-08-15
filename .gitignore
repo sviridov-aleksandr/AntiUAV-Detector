@@ -36,7 +36,9 @@ prepare_data/drone_only_dataset/
 prepare_data/all_datasets_v1/
 prepare_data/drone_v2/
 prepare_data/antiuav_yolo/
+prepare_data/antiuav_ir_yolo/
 prepare_data/merged_v1/
+prepare_data/merged_v2/
 
 # Видео FPV (большие файлы)
 video-FPV/
