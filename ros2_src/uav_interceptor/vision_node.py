@@ -130,6 +130,11 @@ class VisionNode(Node):
         self.declare_parameter('camera_fov_h', 60.0)     # horizontal FOV (deg)
         self.declare_parameter('drone_size_m', 0.35)     # target physical size (m)
         self.declare_parameter('lead_frames', 5)         # Kalman lead (frames ahead)
+
+        # Радиоканал: компенсация задержки (наземная обработка)
+        self.declare_parameter('link_latency', 0.15)     # round-trip задержка (сек)
+        # lead_frames компенсирует движение цели за время задержки канала:
+        # effective_lead = lead_frames + (link_latency * fps)
         # Intercept
         self.declare_parameter('interceptor_speed', 15.0)  # max speed (m/s)
         self.declare_parameter('intercept_distance', 3.0)  # INTERCEPT trigger (m)
@@ -169,9 +174,17 @@ class VisionNode(Node):
         fov_h = self.get_parameter('camera_fov_h').value
         drone_size = self.get_parameter('drone_size_m').value
         lead_frames = self.get_parameter('lead_frames').value
+        link_latency = self.get_parameter('link_latency').value
+        # Компенсация задержки радиоканала: добавляем lead-кадры
+        # пропорционально времени задержки (при 30 FPS: 0.15s → +4.5 кадра)
+        latency_lead = int(link_latency * 30)  # предполагаем 30 FPS
+        effective_lead = lead_frames + latency_lead
+        self.get_logger().info(
+            f'Lead prediction: base={lead_frames}, latency={latency_lead} '
+            f'(link_latency={link_latency:.3f}s), total={effective_lead}')
         self.target_estimator = TargetEstimator.from_fov(
             fov_h_deg=fov_h, image_width_px=1280,
-            real_size_m=drone_size, lead_frames=lead_frames)
+            real_size_m=drone_size, lead_frames=effective_lead)
 
         # Intercept calculator
         self.intercept_calc = InterceptCalculator(

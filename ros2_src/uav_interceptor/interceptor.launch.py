@@ -5,91 +5,95 @@ from launch.substitutions import LaunchConfiguration
 
 
 def generate_launch_description():
-    """Launch the full interceptor pipeline: video -> vision -> mavlink."""
+    """Launch the full interceptor pipeline: WFB video → vision → MAVLink.
+
+    Наземная архитектура (НСУ на Jetson Orin Nano):
+      Борт (Orange Pi 3Z) → WFB radio → НСУ (Jetson) → MAVLink → Борт
+
+    Узлы:
+      1. wfb_video_receiver — приём EO+IR видео через WFB
+      2. vision_node — YOLO + IR + OF + Fusion + PID + State Machine
+      3. mavlink_bridge — MAVLink через WFB radio link
+    """
     return LaunchDescription([
-        # ─── Video source ───
+        # ─── Video source (WFB) ───
         DeclareLaunchArgument(
-            'source_type',
-            default_value='file',
-            description='Video source: file | rtsp | usb'
-        ),
+            'eo_pipe', default_value='/tmp/wfb_rx_video0',
+            description='WFB rx pipe: EO-видео (OpenIPC H.265)'),
         DeclareLaunchArgument(
-            'video_path',
-            default_value='/home/alex/AntiUAV-Detector/video-FPV/Video/v2.mp4',
-            description='Path to test video file (source_type=file)'
-        ),
+            'ir_pipe', default_value='/tmp/wfb_rx_video1',
+            description='WFB rx pipe: IR-видео (H.264)'),
         DeclareLaunchArgument(
-            'rtsp_url',
-            default_value='rtsp://192.168.1.10:554/live',
-            description='RTSP stream URL (source_type=rtsp, OpenIPC MC800S-V3)'
-        ),
+            'eo_format', default_value='h265',
+            description='EO-видео кодек: h265 | h264'),
         DeclareLaunchArgument(
-            'usb_device',
-            default_value='/dev/video0',
-            description='USB camera device (source_type=usb)'
-        ),
+            'ir_format', default_value='h264',
+            description='IR-видео кодек: h264 | h265'),
         DeclareLaunchArgument(
-            'target_fps',
-            default_value='30',
-            description='Target publish FPS'
-        ),
+            'eo_width', default_value='1280'),
+        DeclareLaunchArgument(
+            'eo_height', default_value='720'),
+        DeclareLaunchArgument(
+            'ir_width', default_value='640'),
+        DeclareLaunchArgument(
+            'ir_height', default_value='480'),
+        DeclareLaunchArgument(
+            'enable_ir', default_value='true',
+            description='Включить IR-поток (dual-band)'),
 
         # ─── MAVLink ───
         DeclareLaunchArgument(
-            'device',
-            default_value='/dev/ttyACM0',
-            description='MAVLink serial device'
-        ),
+            'link_mode', default_value='radio',
+            description='MAVLink: radio (WFB) | direct (USB/UART)'),
         DeclareLaunchArgument(
-            'simulation',
-            default_value='false',
-            description='Run without real hardware (test mode)'
-        ),
+            'wfb_tx_pipe', default_value='/tmp/wfb_tx_command',
+            description='WFB tx pipe: команды вверх'),
+        DeclareLaunchArgument(
+            'wfb_rx_pipe', default_value='/tmp/wfb_rx_telemetry',
+            description='WFB rx pipe: телеметрия вниз'),
+        DeclareLaunchArgument(
+            'device', default_value='/dev/ttyACM0',
+            description='MAVLink device (для link_mode=direct)'),
+        DeclareLaunchArgument(
+            'simulation', default_value='false',
+            description='Тестовый режим (без железа)'),
 
         # ─── Vision ───
         DeclareLaunchArgument(
             'model_path',
-            default_value='/home/alex/AntiUAV-Detector/runs/detect/train/runs/drone_v2-5/weights/best.pt',
-            description='YOLO model path (.pt, .onnx or .engine)'
-        ),
+            default_value='/home/alex/AntiUAV-Detector/runs/detect/train/runs/drone_v2-5/weights/best.engine',
+            description='YOLO model (.pt, .onnx или .engine)'),
         DeclareLaunchArgument(
-            'show_image',
-            default_value='true',
-            description='Show detection window (needs display)'
-        ),
+            'show_image', default_value='true'),
         DeclareLaunchArgument(
-            'use_dual_band',
-            default_value='false',
-            description='Enable dual-band EO+IR fusion (requires IR stream)'
-        ),
+            'use_dual_band', default_value='true',
+            description='Dual-band EO+IR fusion (требует IR-поток)'),
         DeclareLaunchArgument(
-            'fusion_mode',
-            default_value='eo_primary',
-            description='Fusion mode: eo_primary | ir_primary | fused'
-        ),
+            'fusion_mode', default_value='eo_primary',
+            description='eo_primary | ir_primary | fused'),
         DeclareLaunchArgument(
-            'ir_topic',
-            default_value='/camera/ir_image_raw',
-            description='ROS topic for IR camera stream'
-        ),
+            'ir_threshold_mode', default_value='adaptive',
+            description='adaptive | fixed | otsu | motion'),
         DeclareLaunchArgument(
-            'ir_threshold_mode',
-            default_value='adaptive',
-            description='IR tracker mode: adaptive | fixed | otsu | motion'
-        ),
+            'link_latency', default_value='0.15',
+            description='Round-trip задержка радиоканала (сек) для lead prediction'),
 
-        # ─── Node 1: Video publisher (camera or test video) ───
+        # ─── Node 1: WFB Video Receiver ───
         Node(
             package='uav_interceptor',
-            executable='video_publisher',
-            name='video_publisher',
+            executable='wfb_video_receiver',
+            name='wfb_video_receiver',
             output='screen',
             parameters=[{
-                'source_type': LaunchConfiguration('source_type'),
-                'video_path': LaunchConfiguration('video_path'),
-                'rtsp_url': LaunchConfiguration('rtsp_url'),
-                'usb_device': LaunchConfiguration('usb_device'),
-                'target_fps': LaunchConfiguration('target_fps'),
+                'eo_pipe': LaunchConfiguration('eo_pipe'),
+                'ir_pipe': LaunchConfiguration('ir_pipe'),
+                'eo_format': LaunchConfiguration('eo_format'),
+                'ir_format': LaunchConfiguration('ir_format'),
+                'eo_width': LaunchConfiguration('eo_width'),
+                'eo_height': LaunchConfiguration('eo_height'),
+                'ir_width': LaunchConfiguration('ir_width'),
+                'ir_height': LaunchConfiguration('ir_height'),
+                'enable_ir': LaunchConfiguration('enable_ir'),
             }],
         ),
 
@@ -104,29 +108,23 @@ def generate_launch_description():
                 {'show_image': LaunchConfiguration('show_image')},
                 {'use_dual_band': LaunchConfiguration('use_dual_band')},
                 {'fusion_mode': LaunchConfiguration('fusion_mode')},
-                {'ir_topic': LaunchConfiguration('ir_topic')},
                 {'ir_threshold_mode': LaunchConfiguration('ir_threshold_mode')},
+                {'link_latency': LaunchConfiguration('link_latency')},
             ],
         ),
 
-        # ─── Node 3: MAVLink bridge (real autopilot or simulation) ───
+        # ─── Node 3: MAVLink bridge (radio или direct) ───
         Node(
             package='uav_interceptor',
             executable='mavlink_bridge',
             name='mavlink_bridge',
             output='screen',
             parameters=[
+                {'link_mode': LaunchConfiguration('link_mode')},
+                {'wfb_tx_pipe': LaunchConfiguration('wfb_tx_pipe')},
+                {'wfb_rx_pipe': LaunchConfiguration('wfb_rx_pipe')},
                 {'device': LaunchConfiguration('device')},
                 {'simulation': LaunchConfiguration('simulation')},
             ],
-        ),
-
-        # ─── Node 4: RViz2 visualization (optional, needs display) ───
-        Node(
-            package='rviz2',
-            executable='rviz2',
-            name='rviz2',
-            output='screen',
-            arguments=['-d', '/home/alex/aerial_nav_ws/src/uav_interceptor/config/interceptor.rviz'],
         ),
     ])
