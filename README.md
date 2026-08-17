@@ -79,10 +79,10 @@ YOLO (EO, видимый спектр) ──► IR Tracker (тепловизо�
 ```
 
 ### YOLO11l (основной детектор, видимый спектр)
-- **Модель:** YOLO11L, 1 класс (Drone), 25.3M параметров
-- **Датасет drone_v2:** 164,732 train / 6,833 val (MyDataSet + combined + негативы)
-- **Текущие метрики (drone_v2-5, эпоха 11):** mAP50=0.897, mAP50-95=0.863
-- **TensorRT FP16:** 37.1 FPS на RTX 5080
+- **Модель:** merged_v1_L (YOLO11L), 1 класс (Drone), 25.3M параметров
+- **Датасет merged_v1:** 268,305 train / 26,841 val (drone_v2 + Anti-UAV-RGBT + Seraphim)
+- **Метрики (эпоха 19/60):** mAP50=0.968, mAP50-95=0.646
+- **TensorRT FP16:** 421 FPS (2.4 мс/кадр) на RTX 5080 Laptop
 
 ### IR Tracker (тепловизионный детектор)
 - Пороговая обработка (adaptive / fixed / otsu) + морфология
@@ -149,7 +149,9 @@ mavlink_bridge: MAV_CMD_DO_SET_SERVO (channel=6, PWM=2000)
 ```
 drone_v2 (164K) ──► YOLO11L (v2-5, 50 epochs) ──► best.pt (mAP50=0.897)
                                                         │
-merged_v1 (268K) ──► YOLO11L (учитель, 60 epochs) ◄──────┘
+merged_v1 (268K) ──► YOLO11L (merged_v1_L, 60 epochs) ◄──┘  ← старт с v2-5
+                         │
+                    best.pt (mAP50=0.968, эпоха 19/60)
                          │
                     soft labels (.npz)
                          │
@@ -159,19 +161,21 @@ merged_v1 (268K) ──► YOLO11L (учитель, 60 epochs) ◄────�
 ```
 
 ### Knowledge Distillation (учитель → студент)
-- **Учитель:** YOLO11L на merged_v1 (максимальная точность)
+- **Учитель:** YOLO11L merged_v1_L (mAP50=0.968)
 - **Студент:** YOLO11M/S/N (для Jetson, быстрее и легче)
 - **Метод:** offline KD — soft labels учителя + transfer weights + пониженный LR
 - **Ожидаемый прирост:** +2-5% mAP для студента по сравнению с обучением с нуля
 
-### Результаты тестов детекции (модель v2-4)
+### Результаты batch-теста (merged_v1_L, 83 видео)
 
-| Тест | Результат | Описание |
-|------|-----------|----------|
-| v67 | 100% | Крупный дрон (~90×100px) |
-| **v68** | **3%** | **Мелкий дрон (8×10px) — главная проблема** |
-| v69/v70 | 18% | Дрон появляется с f=165, крупный |
-| v78 | 90% | Полный цикл перехвата |
+| Метрика | Значение |
+|---------|----------|
+| **STRIKE (успешный перехват)** | **6 / 83 (7.2%)** |
+| Средняя доля детекций | 58.6% |
+| Средний FPS | 123 |
+| Трекер | ByteTrack |
+
+**STRIKE-видео:** m4.MOV (2.46 мин), v12 (2.17 мин), v22 (3.88 мин), v6 (0.91 мин), v61 (0.37 мин), v62 (0.44 мин)
 
 ### Симулятор полного пайплайна
 ```bash
@@ -197,7 +201,7 @@ python3 train/simulate_intercept.py video.mp4 [strategy] [kill_radius] [intercep
 | ROS2 | Lyrical |
 | Ultralytics | 8.4.117 (YOLO11) |
 | PyTorch | 2.x (CUDA 13.0) |
-| OpenCV | 4.x |
+| OpenCV | 5.0.0 |
 | pymavlink | 2.4.49 |
 | GPU (PC) | RTX 5080 Laptop 16GB |
 | GPU (deploy) | NVIDIA Jetson Orin |
@@ -213,6 +217,10 @@ AntiUAV-Detector/
 │   ├── run_merged_v1.py            # Обучение учителя на merged_v1 (268K)
 │   ├── distill_yolo.py             # Knowledge Distillation (учитель→студент)
 │   ├── simulate_intercept.py       # Симулятор полного пайплайна (без ROS2)
+│   ├── batch_test_videos.py        # Пакетный тест всех видео (83 шт.)
+│   ├── osd_filter.py               # Умный OSD-фильтр (is_osd_false_positive)
+│   ├── analyze_failures.py         # Разбор проблемных видео
+│   ├── compare_track_predict.py    # Сравнение трекера и предсказания
 │   ├── target_estimator.py         # RangeEstimator + KalmanTracker + InterceptCalculator
 │   ├── optical_flow_tracker.py     # Farneback + affine compensation
 │   ├── hybrid_detector.py          # [НЕ ИСПОЛЬЗОВАТЬ] OF→YOLO ROI
@@ -231,7 +239,7 @@ AntiUAV-Detector/
 │   ├── ir_tracker.py               # Thermal detection (threshold + morphology)
 │   ├── optical_flow_tracker.py     # Dense OF + motion compensation
 │   ├── target_estimator.py         # Range + Kalman + Intercept
-│   └── interceptor.launch.py       # Launch-файл со всеми параметрами
+│   └── launch/interceptor.launch.py # Launch-файл со всеми параметрами
 ├── export_tensorrt.py              # Экспорт ONNX + TensorRT FP16
 ├── docs/
 │   └── DEPLOY_JETSON.md            # Инструкция деплоя на Jetson Orin
@@ -317,7 +325,7 @@ source ~/aerial_nav_ws/install/setup.bash
 export PYTHONPATH="$HOME/AntiUAV-Detector/venv/lib/python3.14/site-packages:$PYTHONPATH"
 
 ros2 launch uav_interceptor interceptor.launch.py \
-    model_path:=/home/alex/AntiUAV-Detector/runs/detect/train/runs/drone_v2-5/weights/best.pt \
+    model_path:=/home/alex/AntiUAV-Detector/runs/detect/train/runs/merged_v1_L/weights/best.pt \
     device:=/dev/ttyACM0 \
     simulation:=false \
     show_image:=true

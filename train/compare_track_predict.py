@@ -47,7 +47,8 @@ def count_track(video_path):
         ret, frame = cap.read()
         if not ret:
             break
-        results = model.track(frame, persist=False, verbose=False, conf=0.15)
+        results = model.track(frame, persist=False, verbose=False, conf=0.15,
+                              tracker='bytetrack.yaml')
         if results and results[0].boxes is not None and len(results[0].boxes) > 0:
             hits += 1
     cap.release()

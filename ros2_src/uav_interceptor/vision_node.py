@@ -342,7 +342,8 @@ class VisionNode(Node):
         eo_ratio = 0.0
 
         results = self.model.track(cv_image, persist=True, verbose=False,
-                                   conf=self.conf_threshold)
+                                   conf=self.conf_threshold,
+                                   tracker='bytetrack.yaml')
 
         if results and results[0].boxes is not None and len(results[0].boxes) > 0:
             box = self.select_target(results[0].boxes, w, h)

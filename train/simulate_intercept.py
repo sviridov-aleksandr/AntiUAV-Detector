@@ -71,7 +71,7 @@ class SimVision:
 
         # --- YOLO ---
         results = self.model.track(frame, persist=True, verbose=False,
-                                   conf=self.conf)
+                                   conf=self.conf, tracker='bytetrack.yaml')
         if results and results[0].boxes is not None and len(results[0].boxes) > 0:
             best = None
             best_area = 0

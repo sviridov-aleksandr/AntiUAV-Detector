@@ -2,7 +2,7 @@
 
 ## Обзор
 
-Модель YOLO11L (drone_v2-5, mAP50=0.897) обучена на PC (RTX 5080, CUDA 13.0, TensorRT 11.2) и экспортирована в:
+Модель YOLO11L (merged_v1_L, mAP50=0.968, mAP50-95=0.646) обучена на PC (RTX 5080, CUDA 13.0, TensorRT 11.2) и экспортирована в:
 
 | Файл | Размер | Формат | Назначение |
 |------|--------|--------|------------|
@@ -18,11 +18,11 @@
 
 ```bash
 # С PC на Jetson (по SSH)
-scp /home/alex/AntiUAV-Detector/runs/detect/train/runs/drone_v2-5/weights/best.onnx \
+scp /home/alex/AntiUAV-Detector/runs/detect/train/runs/merged_v1_L/weights/best.onnx \
     user@jetson-ip:/home/user/AntiUAV-Detector/weights/
 
 # FP16 ONNX (опционально, для сравнения точности)
-scp /home/alex/AntiUAV-Detector/runs/detect/train/runs/drone_v2-5/weights/best.fp16.onnx \
+scp /home/alex/AntiUAV-Detector/runs/detect/train/runs/merged_v1_L/weights/best.fp16.onnx \
     user@jetson-ip:/home/user/AntiUAV-Detector/weights/
 ```
 
@@ -281,7 +281,7 @@ ros2 launch uav_interceptor interceptor.launch.py \
 ## 10. Полный чеклист деплоя
 
 ### Подготовка (на PC)
-- [x] Модель обучена (drone_v2-5, mAP50=0.897)
+- [x] Модель обучена (merged_v1_L, mAP50=0.968, mAP50-95=0.646)
 - [x] ONNX FP32 экспортирован (`best.onnx`, 97 MB)
 - [x] ONNX FP16 экспортирован (`best.fp16.onnx`, 49 MB)
 - [x] TensorRT engine для PC собран (`best.engine`, 50 MB)
