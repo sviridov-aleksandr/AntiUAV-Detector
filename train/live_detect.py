@@ -14,6 +14,9 @@ import time
 from pathlib import Path
 from ultralytics import YOLO
 
+sys.path.insert(0, 'train')
+from osd_filter import is_osd_false_positive
+
 # Флаг для корректного завершения по сигналу (Ctrl+C, kill)
 _running = True
 
@@ -94,9 +97,8 @@ def main():
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                 conf = float(box.conf[0])
 
-                # OSD-фильтр
-                if (y1 < OSD_MARGIN or y2 > h - OSD_MARGIN or
-                    x1 < OSD_MARGIN or x2 > w - OSD_MARGIN):
+                # OSD-фильтр (умный)
+                if is_osd_false_positive(x1, y1, x2, y2, w, h, margin=OSD_MARGIN):
                     continue
 
                 area = (x2 - x1) * (y2 - y1)

@@ -15,6 +15,7 @@ Usage:
 
 import cv2
 import numpy as np
+import os
 import sys
 import time
 
@@ -22,6 +23,7 @@ sys.path.insert(0, 'train')
 from ultralytics import YOLO
 from optical_flow_tracker import OpticalFlowTracker
 from target_estimator import TargetEstimator, RangeEstimator, InterceptCalculator
+from osd_filter import is_osd_false_positive
 
 
 class SimVision:
@@ -78,8 +80,8 @@ class SimVision:
                 if cls != 0:
                     continue
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                # OSD filter (basic)
-                if y1 < 60 or y2 > h - 60 or x1 < 60 or x2 > w - 60:
+                # OSD filter (smart)
+                if is_osd_false_positive(x1, y1, x2, y2, w, h):
                     continue
                 area = (x2 - x1) * (y2 - y1)
                 if area > best_area:
@@ -243,7 +245,13 @@ def main():
     kill_radius = float(sys.argv[3]) if len(sys.argv) > 3 else 4.0
     intercept_distance = float(sys.argv[4]) if len(sys.argv) > 4 else 8.0
 
-    model_path = 'runs/detect/train/runs/drone_v2-4/weights/best.pt'
+    # Путь к модели: аргумент > ENV > хардкод
+    model_path = os.environ.get('MODEL_PATH', None)
+    if model_path is None:
+        model_path = sys.argv[5] if len(sys.argv) > 5 else None
+    if model_path is None:
+        model_path = 'runs/detect/train/runs/drone_v2-5/weights/best.pt'
+
     sim = SimVision(model_path, strategy=strategy,
                     kill_radius=kill_radius, intercept_distance=intercept_distance)
 

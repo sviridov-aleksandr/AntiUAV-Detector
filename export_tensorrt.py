@@ -16,7 +16,7 @@ from pathlib import Path
 from ultralytics import YOLO
 
 MODEL = sys.argv[1] if len(sys.argv) > 1 else \
-    "/home/alex/AntiUAV-Detector/runs/detect/train/runs/drone_v2-5/weights/best.pt"
+    "/home/alex/AntiUAV-Detector/runs/detect/train/runs/merged_v1_L/weights/best.pt"
 
 
 def main():

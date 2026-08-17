@@ -52,3 +52,8 @@ Thumbs.db
 
 # Отдельный проект (wifi-broadcast) — НЕ часть AntiUAV-Detector
 wifi-broadcast-receiver/
+# Сгенерированные артефакты (не коммитим)
+analysis_failures/
+batch_test_results.csv
+docs/session_log.md
+docs/update_session_log.err

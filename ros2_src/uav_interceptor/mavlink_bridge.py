@@ -7,21 +7,20 @@ ROS2 Node: MAVLink Bridge (наземная НСУ).
   - Телеметрия: WFB rx ← борт ← CUAV → ROS2 topics
 
 Два режима подключения:
-  1. radio: через WFB named pipes (наземная архитектура)
+  1. radio: через WFB-ng UDP (наземная архитектура)
   2. direct: через USB/UART (локальное подключение, для тестов)
 
-Дополнительные функции (по сравнению с бортовой версией):
+Дополнительные функции:
   - Армирование (MAV_CMD_COMPONENT_ARM_DISARM)
   - Failsafe: RTL при потере связи / timeout
   - Pre-flight checks (батарея, GPS, режим)
-  - Geofence: проверка координат перед INTERCEPT
   - Kill switch: немедленная остановка моторов
+  - GCS heartbeat (1 Hz) для WFB-ng mavlink service
 
 Запуск (на Jetson Orin Nano, НСУ):
   ros2 run uav_interceptor mavlink_bridge --ros-args \
     -p link_mode:=radio \
-    -p wfb_tx_pipe:=/tmp/wfb_tx_command \
-    -p wfb_rx_pipe:=/tmp/wfb_rx_telemetry \
+    -p mavlink_udp_port:=14550 \
     -p simulation:=false
 """
 
@@ -32,11 +31,10 @@ from geometry_msgs.msg import Twist, Vector3Stamped
 from std_msgs.msg import Float64, String, Bool
 from sensor_msgs.msg import NavSatFix, Imu
 from pymavlink import mavutil
+from pymavlink.dialects.v20 import ardupilotmega as mavlink_dialect
 import time
 import math
-import os
 import socket
-import struct
 
 
 class MavlinkBridge(Node):
@@ -55,12 +53,12 @@ class MavlinkBridge(Node):
         self.declare_parameter('strike_servo_pwm', 2000)
 
         # ─── Параметры безопасности ───
-        self.declare_parameter('auto_arm', False)  # авто-арминг (опасно!)
-        self.declare_parameter('command_timeout', 1.0)  # timeout → hover
-        self.declare_parameter('link_loss_timeout', 5.0)  # timeout → RTL
+        self.declare_parameter('auto_arm', False)
+        self.declare_parameter('command_timeout', 1.0)
+        self.declare_parameter('link_loss_timeout', 5.0)
         self.declare_parameter('min_battery_voltage', 14.0)  # 4S min
         self.declare_parameter('geofence_enabled', True)
-        self.declare_parameter('geofence_max_dist', 500.0)  # м от точки старта
+        self.declare_parameter('geofence_max_dist', 500.0)
 
         self.link_mode = self.get_parameter('link_mode').value
         self.device = self.get_parameter('device').value
@@ -113,10 +111,12 @@ class MavlinkBridge(Node):
         self.link_status_pub = self.create_publisher(
             String, '/telemetry/link_status', telemetry_qos)
 
-        # ─── MAVLink connection ───
-        self.mavlink_conn = None
-        self.udp_sock = None  # UDP socket (radio mode)
+        # ─── MAVLink connection state ───
+        self.mavlink_conn = None       # pymavlink connection (direct mode)
+        self.udp_sock = None           # UDP socket (radio mode)
+        self.wfb_addr = None           # Source address of WFB-ng (learned from first packet)
         self.rx_buf = bytearray()
+        self.mav_serializer = None     # MAVLink serializer for radio mode
 
         self.armed = False
         self.last_heartbeat_time = time.time()
@@ -126,6 +126,10 @@ class MavlinkBridge(Node):
         self.home_lat = None
         self.home_lon = None
         self.battery_voltage = 0.0
+        self.gcs_sys_id = 255          # GCS system ID
+        self.gcs_comp_id = 0           # GCS component ID
+        self.target_sys_id = 1         # Target (CUAV) system ID
+        self.target_comp_id = 1        # Target component ID
 
         if not self.simulation:
             self._connect()
@@ -135,6 +139,7 @@ class MavlinkBridge(Node):
         # ─── Timers ───
         self.status_timer = self.create_timer(1.0, self.status_callback)
         self.telemetry_timer = self.create_timer(0.05, self.telemetry_callback)  # 20 Hz
+        self.heartbeat_timer = self.create_timer(1.0, self.heartbeat_send_callback)
 
         self.get_logger().info(
             f'MAVLink Bridge запущен (link={self.link_mode}, '
@@ -152,11 +157,18 @@ class MavlinkBridge(Node):
             self._connect_direct()
 
     def _connect_radio(self):
-        """Подключение через WFB-ng (UDP 14550).
+        """Подключение через WFB-ng (UDP).
 
         WFB-ng на земле (gs.cfg) пробрасывает MAVLink:
           gs_mavlink peer = connect://127.0.0.1:14550
-        Этот узел слушает UDP 14550 и общается с бортом через WFB-ng.
+
+        WFB-ng подключается к 127.0.0.1:14550 как UDP-клиент:
+          - отправляет телеметрию (с борта) на порт 14550
+          - принимает команды с порта 14550
+
+        Этот узел:
+          - слушает UDP 14550 (принимает телеметрию)
+          - отправляет команды обратно на адрес WFB-ng (learned from first packet)
         """
         try:
             self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -164,9 +176,14 @@ class MavlinkBridge(Node):
             self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2097152)
             self.udp_sock.bind(('127.0.0.1', self.mavlink_udp_port))
             self.udp_sock.settimeout(0.05)
+
+            # MAVLink serializer для radio mode (без подключения)
+            self.mav_serializer = mavlink_dialect.MAVLink(
+                None, src_system=self.gcs_sys_id, src_component=self.gcs_comp_id)
+
             self.get_logger().info(
-                f'WFB radio: UDP 127.0.0.1:{self.mavlink_udp_port} '
-                f'(WFB-ng gs_mavlink)')
+                f'WFB radio: слушаю UDP 127.0.0.1:{self.mavlink_udp_port} '
+                f'(ожидание данных от WFB-ng)')
         except Exception as e:
             self.get_logger().error(f'UDP socket failed: {e}')
             self.simulation = True
@@ -189,7 +206,11 @@ class MavlinkBridge(Node):
         try:
             self.mavlink_conn.wait_heartbeat(timeout=10)
             self.last_heartbeat_time = time.time()
-            self.get_logger().info('Heartbeat получен!')
+            self.target_sys_id = self.mavlink_conn.target_system
+            self.target_comp_id = self.mavlink_conn.target_component
+            self.get_logger().info(
+                f'Heartbeat получен! sysid={self.target_sys_id}, '
+                f'compid={self.target_comp_id}')
         except Exception as e:
             self.get_logger().error(f'Нет heartbeat: {e}')
 
@@ -211,23 +232,29 @@ class MavlinkBridge(Node):
             mavutil.mavlink.MAV_DATA_STREAM_EXTENDED_STATUS,
         ]
         for stream in streams:
-            self.mavlink_conn.mav.request_data_stream_send(1, 1, stream, 10, 1)
+            self.mavlink_conn.mav.request_data_stream_send(
+                self.target_sys_id, self.target_comp_id, stream, 10, 1)
         self.get_logger().info('Потоки телеметрии запрошены (10 Hz)')
 
     # ─────────────────────────────────────────────────────────
-    #  Отправка MAVLink команд
+    #  Отправка MAVLink
     # ─────────────────────────────────────────────────────────
 
     def _send_raw(self, data: bytes):
-        """Отправка raw MAVLink байтов (через UDP или direct)."""
+        """Отправка raw MAVLink байтов."""
         if self.simulation:
             return
         if self.link_mode == 'radio' and self.udp_sock is not None:
+            if self.wfb_addr is None:
+                self.get_logger().warn(
+                    'TX отложен: WFB-ng адрес ещё не известен '
+                    '(ожидание первого пакета телеметрии)',
+                    throttle_duration_sec=5.0)
+                return
             try:
-                # WFB-ng gs_mavlink слушает UDP 14550
-                self.udp_sock.sendto(data, ('127.0.0.1', self.mavlink_udp_port))
-            except Exception:
-                pass
+                self.udp_sock.sendto(data, self.wfb_addr)
+            except Exception as e:
+                self.get_logger().debug(f'TX error: {e}')
         elif self.mavlink_conn is not None:
             self.mavlink_conn.write(data)
 
@@ -239,32 +266,20 @@ class MavlinkBridge(Node):
                 f'[SIM] CMD={command} p1={param1} p2={param2}')
             return
 
-        # Создаём MAVLink-сообщение
         if self.mavlink_conn is not None:
-            # Direct mode: используем стандартный API
+            # Direct mode
             self.mavlink_conn.mav.command_long_send(
-                1, 1, command, 0,
+                self.target_sys_id, self.target_comp_id, command, 0,
                 param1, param2, param3, param4, param5, param6, param7)
-        else:
-            # Radio mode: создаём сообщение вручную и сериализуем
-            msg = self.mavlink_conn.mav.command_long_encode(
-                1, 1, command, 0,
-                param1, param2, param3, param4, param5, param6, param7) \
-                if self.mavlink_conn else None
-
-            # Если нет mavlink_conn (radio only), создаём временный
-            if msg is None:
-                # Создаём MAVLink-сериализатор без подключения
-                from pymavlink.dialects.v20 import ardupilotmega as mavlink
-                mav = mavlink.MAVLink(None, 2, 1)
-                msg = mav.command_long_encode(
-                    1, 1, command, 0,
-                    param1, param2, param3, param4, param5, param6, param7)
-                self._send_raw(msg.pack(mav))
+        elif self.mav_serializer is not None:
+            # Radio mode
+            msg = self.mav_serializer.command_long_encode(
+                self.target_sys_id, self.target_comp_id, command, 0,
+                param1, param2, param3, param4, param5, param6, param7)
+            self._send_raw(msg.pack(self.mav_serializer))
 
     def send_velocity_command(self, vx, vy, vz, yaw_rate):
-        """Отправка команды скорости через MAVLink.
-        set_position_target_local_ned_send, frame=BODY_OFFSET_NED."""
+        """Отправка команды скорости (BODY_OFFSET_NED)."""
         if self.simulation:
             return
 
@@ -283,26 +298,47 @@ class MavlinkBridge(Node):
         if self.mavlink_conn is not None:
             # Direct mode
             self.mavlink_conn.mav.set_position_target_local_ned_send(
-                time_boot_ms, 1, 1,
+                time_boot_ms, self.target_sys_id, self.target_comp_id,
                 mavutil.mavlink.MAV_FRAME_BODY_OFFSET_NED,
                 type_mask,
                 0, 0, 0,
                 float(vx), float(vy), float(vz),
                 0, 0, 0,
                 0, float(yaw_rate))
-        else:
-            # Radio mode: сериализуем вручную
-            from pymavlink.dialects.v20 import ardupilotmega as mavlink
-            mav = mavlink.MAVLink(None, 2, 1)
-            msg = mav.set_position_target_local_ned_encode(
-                time_boot_ms, 1, 1,
+        elif self.mav_serializer is not None:
+            # Radio mode
+            msg = self.mav_serializer.set_position_target_local_ned_encode(
+                time_boot_ms, self.target_sys_id, self.target_comp_id,
                 mavutil.mavlink.MAV_FRAME_BODY_OFFSET_NED,
                 type_mask,
                 0, 0, 0,
                 float(vx), float(vy), float(vz),
                 0, 0, 0,
                 0, float(yaw_rate))
-            self._send_raw(msg.pack(mav))
+            self._send_raw(msg.pack(self.mav_serializer))
+
+    def heartbeat_send_callback(self):
+        """Отправка GCS heartbeat (1 Hz).
+
+        WFB-ng mavlink service и ArduPilot ожидают periodic heartbeat
+        от GCS для поддержания связи. Без него телеметрия может не идти.
+        """
+        if self.simulation:
+            return
+
+        if self.mavlink_conn is not None:
+            # Direct mode
+            self.mavlink_conn.mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_GCS,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                0, 0, 0)
+        elif self.mav_serializer is not None:
+            # Radio mode
+            msg = self.mav_serializer.heartbeat_encode(
+                mavutil.mavlink.MAV_TYPE_GCS,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                0, 0, 0)
+            self._send_raw(msg.pack(self.mav_serializer))
 
     # ─────────────────────────────────────────────────────────
     #  ROS Callbacks
@@ -357,7 +393,6 @@ class MavlinkBridge(Node):
         """Kill switch — немедленная остановка моторов."""
         self.get_logger().error('*** KILL SWITCH ***')
         if not self.simulation:
-            # DISARM с force (param2=21196 — override)
             self._send_command(
                 mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
                 0, 21196)
@@ -377,10 +412,20 @@ class MavlinkBridge(Node):
             self._read_direct_telemetry()
 
     def _read_radio_telemetry(self):
-        """Чтение телеметрии из UDP (WFB-ng gs_mavlink)."""
+        """Чтение телеметрии из UDP (WFB-ng gs_mavlink).
+
+        WFB-ng подключается к нашему порту 14550. Первый пакет
+        раскрывает адрес WFB-ng — сохраняем его для отправки команд.
+        """
         try:
-            data, _ = self.udp_sock.recvfrom(4096)
+            data, addr = self.udp_sock.recvfrom(4096)
             if data:
+                # Запоминаем адрес WFB-ng для отправки команд
+                if self.wfb_addr is None:
+                    self.wfb_addr = addr
+                    self.get_logger().info(
+                        f'WFB-ng обнаружен: {addr[0]}:{addr[1]} — '
+                        f'команды будут отправляться сюда')
                 self.rx_buf.extend(data)
                 self._process_rx_buffer()
         except socket.timeout:
@@ -399,17 +444,19 @@ class MavlinkBridge(Node):
             self.get_logger().debug(f'Telemetry read error: {e}')
 
     def _process_rx_buffer(self):
-        """Парсинг MAVLink-сообщений из буфера WFB rx."""
+        """Парсинг MAVLink-сообщений из буфера."""
         while len(self.rx_buf) >= 2:
             if self.rx_buf[0] not in (0xFD, 0xFE):
                 self.rx_buf.pop(0)
                 continue
 
             if self.rx_buf[0] == 0xFD:
+                # MAVLink 2
                 if len(self.rx_buf) < 3:
                     break
                 plen = self.rx_buf[1] + 12
             else:
+                # MAVLink 1
                 if len(self.rx_buf) < 6:
                     break
                 plen = self.rx_buf[1] + 8
@@ -420,14 +467,11 @@ class MavlinkBridge(Node):
             packet = bytes(self.rx_buf[:plen])
             del self.rx_buf[:plen]
 
-            # Десериализация
             try:
-                from pymavlink.dialects.v20 import ardupilotmega as mavlink
-                mav = mavlink.MAVLink(None, 2, 1)
-                msg = mav.decode(packet)
+                msg = self.mav_serializer.decode(packet)
                 self._process_message(msg)
             except Exception:
-                pass  # повреждённый пакет — пропускаем
+                pass
 
     def _process_message(self, msg):
         """Обработка MAVLink-сообщения → ROS2 публикация."""
@@ -435,6 +479,12 @@ class MavlinkBridge(Node):
 
         if mtype == 'HEARTBEAT':
             self.last_heartbeat_time = time.time()
+            # Обновляем target sys/comp ID из heartbeat
+            if hasattr(msg, 'sysid') and msg.sysid > 0:
+                self.target_sys_id = msg.sysid
+            if hasattr(msg, 'compid') and msg.compid >= 0:
+                self.target_comp_id = msg.compid
+
             mode = mavutil.mode_string_v2(msg)
             mode_msg = String()
             mode_msg.data = mode if mode else 'UNKNOWN'
@@ -455,7 +505,6 @@ class MavlinkBridge(Node):
             heading_msg.data = msg.hdg / 100.0
             self.heading_pub.publish(heading_msg)
 
-            # Geofence: сохраняем home point
             if self.home_lat is None:
                 self.home_lat = gps_msg.latitude
                 self.home_lon = gps_msg.longitude
@@ -467,8 +516,7 @@ class MavlinkBridge(Node):
             speed_msg.data = msg.groundspeed
             self.ground_speed_pub.publish(speed_msg)
 
-            # Батарея
-            self.battery_voltage = msg.battery_voltage / 100.0  # centiV → V
+            self.battery_voltage = msg.battery_voltage / 100.0
             bat_msg = Float64()
             bat_msg.data = self.battery_voltage
             self.battery_pub.publish(bat_msg)
@@ -505,7 +553,6 @@ class MavlinkBridge(Node):
                 f'ПОТЕРЯ СВЯЗИ ({link_age:.1f}s > {self.link_loss_timeout}s) — RTL!')
             self._send_command(mavutil.mavlink.MAV_CMD_DO_SET_MODE,
                                mavutil.mavlink.MAV_MODE_AUTO_ARMED)
-            # RTL mode = 6 для ArduPilot
             self._send_command(mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH)
             link_msg = String()
             link_msg.data = f'LOST ({link_age:.1f}s)'
@@ -530,7 +577,7 @@ class MavlinkBridge(Node):
                 self.send_velocity_command(0, 0, 0, 0)
             self.cmd_vel_received = False
 
-        # Auto-arm (если включён)
+        # Auto-arm
         if self.auto_arm and not self.armed and not self.simulation:
             self.get_logger().warn('Auto-arm...')
             self._send_command(

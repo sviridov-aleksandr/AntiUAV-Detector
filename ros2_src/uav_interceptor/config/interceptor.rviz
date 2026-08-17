@@ -1,0 +1,50 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+    Current:
+      Class: rviz_default_plugins/Views/Orbit
+      Distance: 10
+      Pitch: 0.5
+      Yaw: 0.0
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+    - Class: rviz_default_plugins/Camera
+      Name: Camera
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /camera/image_raw
+    - Class: rviz_default_plugins/Image
+      Name: Detection View
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /camera/image_raw
+  Global Options:
+    Background Color: 0; 0; 0
+    Fixed Frame: map
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+Toolbars:
+  - Class: rviz_common/ToolBar
+    Name: rviz_common/ToolBar
+  - Class: rviz_common/ToolBar
+    Name: Standard Views
+Window Geometry:
+  Height: 800
+  Width: 1200

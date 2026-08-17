@@ -58,7 +58,7 @@ def generate_launch_description():
         # ─── Vision ───
         DeclareLaunchArgument(
             'model_path',
-            default_value='/home/alex/AntiUAV-Detector/runs/detect/train/runs/drone_v2-5/weights/best.engine',
+            default_value='/home/alex/AntiUAV-Detector/runs/detect/train/runs/merged_v1_L/weights/best.engine',
             description='YOLO model (.pt, .onnx или .engine)'),
         DeclareLaunchArgument(
             'show_image', default_value='true'),

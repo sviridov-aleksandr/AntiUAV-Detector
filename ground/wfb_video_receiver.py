@@ -240,29 +240,8 @@ class WFBVideoReceiver(Node):
 
 
 def main(args=None):
-    parser = argparse.ArgumentParser(description='WFB Video Receiver (НСУ)')
-    parser.add_argument('--eo-udp-port', type=int, default=5600)
-    parser.add_argument('--ir-udp-port', type=int, default=5601)
-    parser.add_argument('--eo-format', choices=['h265', 'h264'], default='h265')
-    parser.add_argument('--ir-format', choices=['h264', 'h265'], default='h264')
-    parser.add_argument('--eo-width', type=int, default=1280)
-    parser.add_argument('--eo-height', type=int, default=720)
-    parser.add_argument('--ir-width', type=int, default=640)
-    parser.add_argument('--ir-height', type=int, default=480)
-    parser.add_argument('--no-ir', action='store_true')
-    parser.add_argument('--no-gstreamer', action='store_true')
-    args = parser.parse_args()
-
-    rclpy.init(args=None)
+    rclpy.init(args=args)
     node = WFBVideoReceiver()
-
-    # Переопределение параметров из CLI
-    node.eo_port = args.eo_udp_port
-    node.ir_port = args.ir_udp_port
-    node.eo_format = args.eo_format
-    node.ir_format = args.ir_format
-    node.enable_ir = not args.no_ir
-    node.use_gstreamer = not args.no_gstreamer
 
     try:
         rclpy.spin(node)

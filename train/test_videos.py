@@ -13,6 +13,9 @@ import time
 from pathlib import Path
 from ultralytics import YOLO
 
+sys.path.insert(0, 'train')
+from osd_filter import is_osd_false_positive
+
 MODEL = sys.argv[1] if len(sys.argv) > 1 else \
     '/home/alex/AntiUAV-Detector/runs/detect/train/runs/drone_v2-5/weights/best.pt'
 VIDEO_DIR = sys.argv[2] if len(sys.argv) > 2 else \
@@ -52,8 +55,7 @@ def test_video(model, video_path):
                 if cls != 0:
                     continue
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                if (y1 < OSD_MARGIN or y2 > h - OSD_MARGIN or
-                    x1 < OSD_MARGIN or x2 > w - OSD_MARGIN):
+                if is_osd_false_positive(x1, y1, x2, y2, w, h, margin=OSD_MARGIN):
                     continue
                 area = (x2 - x1) * (y2 - y1)
                 if area < MIN_BBOX_AREA:
