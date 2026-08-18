@@ -123,8 +123,11 @@ class MavlinkBridge(Node):
         self.last_cmd_time = time.time()
         self.cmd_vel_received = False
         self.boot_time = time.time()
+        self._debug_count = 0
         self.home_lat = None
         self.home_lon = None
+        self._cur_lat = None
+        self._cur_lon = None
         self.battery_voltage = 0.0
         self.gcs_sys_id = 255          # GCS system ID
         self.gcs_comp_id = 0           # GCS component ID
@@ -215,26 +218,40 @@ class MavlinkBridge(Node):
             self.get_logger().error(f'Нет heartbeat: {e}')
 
     def set_guided_mode(self):
-        """Переключение FC в GUIDED mode."""
+        """Переключение FC в GUIDED mode (ArduPilot custom_mode=4)."""
+        # ArduPilot: MAV_CMD_DO_SET_MODE с custom_mode через MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
         self._send_command(
             mavutil.mavlink.MAV_CMD_DO_SET_MODE,
-            mavutil.mavlink.MAV_MODE_GUIDED_ARMED)
-        self.get_logger().info('GUIDED mode запрошен')
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            4)  # custom_mode=4 → GUIDED
+        self.get_logger().info('GUIDED mode запрошен (custom_mode=4)')
 
     def request_data_streams(self):
-        """Запрос потоков телеметрии (только для direct mode)."""
+        """Запрос потоков телеметрии (SET_MESSAGE_INTERVAL, ArduPilot 4.3+).
+
+        request_data_stream устарел и игнорируется новыми прошивками.
+        SET_MESSAGE_INTERVAL задаёт период в микросекундах для каждого
+        MAVLink-сообщения напрямую.
+        """
         if self.mavlink_conn is None:
             return
-        streams = [
-            mavutil.mavlink.MAV_DATA_STREAM_POSITION,
-            mavutil.mavlink.MAV_DATA_STREAM_EXTRA1,
-            mavutil.mavlink.MAV_DATA_STREAM_EXTRA2,
-            mavutil.mavlink.MAV_DATA_STREAM_EXTENDED_STATUS,
-        ]
-        for stream in streams:
-            self.mavlink_conn.mav.request_data_stream_send(
-                self.target_sys_id, self.target_comp_id, stream, 10, 1)
-        self.get_logger().info('Потоки телеметрии запрошены (10 Hz)')
+        # (message_id, период в мкс) — 10 Hz для навигации, 5 Hz для статуса
+        intervals = {
+            mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE: 100000,          # 10 Hz
+            mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT: 100000,  # 10 Hz
+            mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD: 100000,           # 10 Hz
+            mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT: 100000,       # 10 Hz
+            mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS: 100000,        # 10 Hz
+            mavutil.mavlink.MAVLINK_MSG_ID_BATTERY_STATUS: 200000,    # 5 Hz
+            mavutil.mavlink.MAVLINK_MSG_ID_RC_CHANNELS: 100000,       # 10 Hz
+            mavutil.mavlink.MAVLINK_MSG_ID_HEARTBEAT: 1000000,        # 1 Hz
+        }
+        for msg_id, interval_us in intervals.items():
+            self._send_command(
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                msg_id, interval_us)
+        self.get_logger().info(
+            'Интервалы телеметрии заданы (SET_MESSAGE_INTERVAL, 10 Hz)')
 
     # ─────────────────────────────────────────────────────────
     #  Отправка MAVLink
@@ -246,7 +263,7 @@ class MavlinkBridge(Node):
             return
         if self.link_mode == 'radio' and self.udp_sock is not None:
             if self.wfb_addr is None:
-                self.get_logger().warn(
+                self.get_logger().warning(
                     'TX отложен: WFB-ng адрес ещё не известен '
                     '(ожидание первого пакета телеметрии)',
                     throttle_duration_sec=5.0)
@@ -362,29 +379,29 @@ class MavlinkBridge(Node):
 
     def strike_callback(self, msg: String):
         """Подрыв БЧ: DO_SET_SERVO на AUX ch6, PWM 2000."""
-        self.get_logger().warn(f'*** STRIKE: {msg.data} ***')
+        self.get_logger().warning(f'*** STRIKE: {msg.data} ***')
 
         if self.simulation:
-            self.get_logger().warn('[SIM] Подрыв БЧ симулирован')
+            self.get_logger().warning('[SIM] Подрыв БЧ симулирован')
             return
 
         self._send_command(
             mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
             self.strike_servo_channel,
             self.strike_servo_pwm)
-        self.get_logger().warn(
+        self.get_logger().warning(
             f'DO_SET_SERVO: ch={self.strike_servo_channel} '
             f'pwm={self.strike_servo_pwm}')
 
     def arm_callback(self, msg: Bool):
         """Армирование / разоружение."""
         if msg.data:
-            self.get_logger().warn('*** ARMING ***')
+            self.get_logger().warning('*** ARMING ***')
             self._send_command(
                 mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1)
             self.armed = True
         else:
-            self.get_logger().warn('*** DISARMING ***')
+            self.get_logger().warning('*** DISARMING ***')
             self._send_command(
                 mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0)
             self.armed = False
@@ -434,14 +451,21 @@ class MavlinkBridge(Node):
             self.get_logger().debug(f'RX read error: {e}')
 
     def _read_direct_telemetry(self):
-        """Чтение телеметрии через direct MAVLink."""
+        """Чтение телеметрии через direct MAVLink (все доступные сообщения)."""
         try:
-            msg = self.mavlink_conn.recv_msg()
-            if msg is None:
-                return
-            self._process_message(msg)
+            for _ in range(50):
+                msg = self.mavlink_conn.recv_msg()
+                if msg is None:
+                    break
+                try:
+                    self._process_message(msg)
+                except Exception as e:
+                    self.get_logger().error(
+                        f'Ошибка обработки {msg.get_type()}: {e}',
+                        throttle_duration_sec=2.0)
         except Exception as e:
-            self.get_logger().debug(f'Telemetry read error: {e}')
+            self.get_logger().error(
+                f'Telemetry read error: {e}', throttle_duration_sec=2.0)
 
     def _process_rx_buffer(self):
         """Парсинг MAVLink-сообщений из буфера."""
@@ -485,7 +509,13 @@ class MavlinkBridge(Node):
             if hasattr(msg, 'compid') and msg.compid >= 0:
                 self.target_comp_id = msg.compid
 
-            mode = mavutil.mode_string_v2(msg)
+            try:
+                mode = mavutil.mode_string_v10(msg)
+                if mode is None:
+                    mode = mavutil.mode_string_acm(msg)
+            except Exception as e:
+                mode = None
+                self.get_logger().debug(f'mode_string: {e}')
             mode_msg = String()
             mode_msg.data = mode if mode else 'UNKNOWN'
             self.mode_pub.publish(mode_msg)
@@ -500,6 +530,10 @@ class MavlinkBridge(Node):
             gps_msg.longitude = msg.lon / 1e7
             gps_msg.altitude = msg.alt / 1000.0
             self.gps_pub.publish(gps_msg)
+
+            # Текущие координаты для geofence
+            self._cur_lat = gps_msg.latitude
+            self._cur_lon = gps_msg.longitude
 
             heading_msg = Float64()
             heading_msg.data = msg.hdg / 100.0
@@ -516,10 +550,13 @@ class MavlinkBridge(Node):
             speed_msg.data = msg.groundspeed
             self.ground_speed_pub.publish(speed_msg)
 
-            self.battery_voltage = msg.battery_voltage / 100.0
-            bat_msg = Float64()
-            bat_msg.data = self.battery_voltage
-            self.battery_pub.publish(bat_msg)
+        elif mtype == 'SYS_STATUS':
+            # Напряжение батареи (мВ) и уровень заряда в SYS_STATUS
+            if msg.voltage_battery != 0xFFFF and msg.voltage_battery > 0:
+                self.battery_voltage = msg.voltage_battery / 1000.0
+                bat_msg = Float64()
+                bat_msg.data = self.battery_voltage
+                self.battery_pub.publish(bat_msg)
 
         elif mtype == 'ATTITUDE':
             imu_msg = Imu()
@@ -538,6 +575,30 @@ class MavlinkBridge(Node):
             vel_msg.vector.z = float(msg.vz)
             self.velocity_pub.publish(vel_msg)
 
+        elif mtype == 'COMMAND_ACK':
+            # Обработка подтверждений команд от автопилота
+            cmd_id = msg.command
+            result = msg.result
+            result_names = {
+                0: 'ACCEPTED',
+                1: 'TEMPORARILY_REJECTED',
+                2: 'DENIED',
+                3: 'UNSUPPORTED',
+                4: 'FAILED',
+                5: 'IN_PROGRESS',
+            }
+            result_str = result_names.get(result, f'UNKNOWN({result})')
+            # result_param2 — код отказа ArduPilot (MAVLink 2)
+            rp2 = getattr(msg, 'result_param2', None)
+            if result == 0:
+                self.get_logger().info(f'ACK: cmd={cmd_id} → {result_str}')
+            elif result == 5:
+                pass  # IN_PROGRESS — не логируем
+            else:
+                self.get_logger().warning(
+                    f'ACK: cmd={cmd_id} → {result_str}'
+                    f' (код отказа: {rp2})')
+
     # ─────────────────────────────────────────────────────────
     #  Безопасность: failsafe, geofence, pre-flight
     # ─────────────────────────────────────────────────────────
@@ -551,9 +612,11 @@ class MavlinkBridge(Node):
         if link_age > self.link_loss_timeout and not self.simulation:
             self.get_logger().error(
                 f'ПОТЕРЯ СВЯЗИ ({link_age:.1f}s > {self.link_loss_timeout}s) — RTL!')
-            self._send_command(mavutil.mavlink.MAV_CMD_DO_SET_MODE,
-                               mavutil.mavlink.MAV_MODE_AUTO_ARMED)
-            self._send_command(mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH)
+            # ArduPilot: custom_mode=6 → RTL
+            self._send_command(
+                mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                6)
             link_msg = String()
             link_msg.data = f'LOST ({link_age:.1f}s)'
             self.link_status_pub.publish(link_msg)
@@ -565,7 +628,7 @@ class MavlinkBridge(Node):
         # Проверка батареи
         if self.battery_voltage > 0 and \
            self.battery_voltage < self.min_battery_voltage:
-            self.get_logger().warn(
+            self.get_logger().warning(
                 f'НИЗКАЯ БАТАРЕЯ: {self.battery_voltage:.1f}V < '
                 f'{self.min_battery_voltage}V')
 
@@ -577,12 +640,38 @@ class MavlinkBridge(Node):
                 self.send_velocity_command(0, 0, 0, 0)
             self.cmd_vel_received = False
 
+        # Geofence: проверка дистанции от home
+        if self.geofence_enabled and self.home_lat is not None and \
+           hasattr(self, '_cur_lat') and hasattr(self, '_cur_lon'):
+            dist = self._haversine(self._cur_lat, self._cur_lon,
+                                   self.home_lat, self.home_lon)
+            if dist > self.geofence_max_dist:
+                self.get_logger().error(
+                    f'GEOFENCE: {dist:.0f}м > {self.geofence_max_dist}м — RTL!')
+                self._send_command(
+                    mavutil.mavlink.MAV_CMD_DOSET_MODE,
+                    mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                    6)  # RTL
+                self.send_velocity_command(0, 0, 0, 0)
+
         # Auto-arm
         if self.auto_arm and not self.armed and not self.simulation:
-            self.get_logger().warn('Auto-arm...')
+            self.get_logger().warning('Auto-arm...')
             self._send_command(
                 mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1)
             self.armed = True
+
+    @staticmethod
+    def _haversine(lat1, lon1, lat2, lon2):
+        """Расчёт дистанции между двумя GPS-точками (метры)."""
+        R = 6371000.0
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlam = math.radians(lon2 - lon1)
+        a = math.sin(dphi / 2) ** 2 + \
+            math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+        return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def main(args=None):
