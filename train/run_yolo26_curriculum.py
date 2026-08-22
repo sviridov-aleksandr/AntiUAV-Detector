@@ -32,7 +32,9 @@ import re
 import subprocess
 from pathlib import Path
 
+import albumentations as A
 from ultralytics import YOLO
+from ultralytics.data import augment as ua_augment
 
 BASE = '/home/alex/AntiUAV-Detector'
 PROJECT = f'{BASE}/train/runs'
@@ -88,6 +90,36 @@ STAGES = [
             fliplr=0.5, mosaic=1.0,
         ),
     ),
+    dict(
+        name='merged_v1_26L_2d',
+        epochs=10,
+        desc='+albumentations: CLAHE, SunFlare, Fog, GaussNoise, MotionBlur, '
+             'JPEGCompression, ISONoise',
+        train=dict(
+            imgsz=640, batch=16, device=0, workers=0, cache='disk',
+            project=PROJECT, patience=15, lr0=0.0005, warmup_epochs=1.0,
+            optimizer='auto',
+            mixup=0.3, copy_paste=0.0, close_mosaic=5,
+            scale=0.7, shear=10.0, degrees=25.0, translate=0.3,
+            perspective=0.001, erasing=0.6,
+            hsv_h=0.02, hsv_s=0.8, hsv_v=0.6,
+            fliplr=0.5, mosaic=1.0,
+        ),
+        # Кастомные albumentations-трансформации для стадии 2d
+        albumentations=[
+            A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=0.3),
+            A.RandomSunFlare(flare_roi=(0, 0, 1, 0.5),
+                             src_radius=100, src_color=(255, 255, 255), p=0.2),
+            A.RandomFog(fog_coef_range=(0.1, 0.4), alpha_coef=0.08, p=0.15),
+            A.GaussNoise(std_range=(0.05, 0.2), mean_range=(0.0, 0.0), p=0.2),
+            A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.5), p=0.15),
+            A.MotionBlur(blur_limit=(3, 10), p=0.2),
+            A.ImageCompression(quality_range=(40, 85), p=0.2),
+            A.RandomBrightnessContrast(brightness_limit=0.3,
+                                       contrast_limit=0.3, p=0.25),
+            A.RandomGamma(gamma_limit=(70, 130), p=0.2),
+        ],
+    ),
 ]
 
 
@@ -109,9 +141,14 @@ def train_stage(stage, start_weights):
     """Обучает одну стадию: resume при наличии last.pt, иначе старт с prev best."""
     name = stage['name']
     data = f'{BASE}/prepare_data/merged_v1/data.yaml'
-    # НЕ создаём папку заранее: Ultralytics сама создаёт её при train(),
-    # иначе при существующей пустой папке добавит суфикс '-2' и сломает resume.
     wdir = Path(PROJECT) / name / 'weights'
+
+    # Если у стадии есть кастомные albumentations — патчим Ultralytics
+    custom_alb = stage.get('albumentations')
+    if custom_alb:
+        _patch_albumentations(custom_alb)
+        print(f'[Стадия {name}] Albumentations: {len(custom_alb)} трансформаций',
+              flush=True)
 
     last = last_weights(stage)
     if last and not stage_done(stage):
@@ -126,6 +163,18 @@ def train_stage(stage, start_weights):
 
     (wdir / DONE_MARK).write_text('ok\n')
     print(f'[Стадия {name}] обучение завершено, маркер поставлен', flush=True)
+
+
+def _patch_albumentations(transforms_list):
+    """Monkey-patch: подменяет дефолтные albumentations в Ultralytics."""
+    original_init = ua_augment.Albumentations.__init__
+
+    def patched_init(self, p=1.0, transforms=None, flip_idx=None):
+        if transforms is None:
+            transforms = transforms_list
+        original_init(self, p=p, transforms=transforms, flip_idx=flip_idx)
+
+    ua_augment.Albumentations.__init__ = patched_init
 
 
 RE_ROW = re.compile(
@@ -208,7 +257,7 @@ def print_comparison(prev, cur, prev_total, cur_total):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--start-stage', type=int, default=1,
-                    help='Стадия для старта (1=2a, 2=2b, 3=2c)')
+                    help='Стадия для старта (1=2a, 2=2b, 3=2c, 4=2d)')
     ap.add_argument('--skip-test', action='store_true',
                     help='Пропустить тест на видео')
     ap.add_argument('--skip-confirmation', action='store_true',
