@@ -113,6 +113,7 @@ class SimVision:
                     drone_detected = True
                     self.detection_source = 'OF'
                     self.stats['of'] += 1
+                    self.current_bbox = (int(x1), int(y1), int(x2), int(y2))
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
                     cv2.putText(frame, "OF TRACK", (x1, y1-10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
@@ -132,8 +133,12 @@ class SimVision:
                 self.last_detection_source = self.detection_source
 
             # Estimator update with REAL bbox
-            est_info = self.estimator.update(self.current_bbox, dt=dt)
-            distance = est_info['distance']
+            if self.current_bbox is not None:
+                est_info = self.estimator.update(self.current_bbox, dt=dt)
+                distance = est_info['distance']
+            else:
+                est_info = {'distance': None, 'lead_point': None}
+                distance = None
 
             # Lead point
             lead = est_info['lead_point']
